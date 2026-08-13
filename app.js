@@ -251,10 +251,11 @@ function renderChart(dailyUsage) {
   const values = chartRows.map((row) => bytesToNumber(row.usageBytes) / 1_000_000_000);
   const maxValue = Math.max(1, ...values);
   const axisSteps = [1, 0.75, 0.5, 0.25, 0];
+  const axisDecimals = maxValue < 1 ? 2 : 0;
 
   axisSteps.forEach((step) => {
     const label = document.createElement("span");
-    label.textContent = `${Math.round(maxValue * step)}`;
+    label.textContent = (maxValue * step).toFixed(axisDecimals);
     elements.chartYAxis.appendChild(label);
   });
 
@@ -295,9 +296,6 @@ function renderSummary(summary) {
   const settings = summary.settings || {};
   const planMode = settings.planMode || "unlimited";
   const totalUsage = bytesToNumber(summary.totalUsageBytes);
-  const latestUsage = bytesToNumber(summary.latestDayUsageBytes);
-  const averageUsage = bytesToNumber(summary.dailyAverageBytes);
-  const projectedUsage = bytesToNumber(summary.projectedMonthEndBytes);
 
   elements.totalUsage.textContent = formatBytes(summary.totalUsageBytes);
   elements.totalDetail.textContent = `${summary.daysRecorded || 0} day${summary.daysRecorded === 1 ? "" : "s"} recorded in month`;
@@ -340,10 +338,6 @@ function renderSummary(summary) {
   } else {
     elements.syncDot.classList.remove("is-error");
   }
-
-  void averageUsage;
-  void projectedUsage;
-  void latestUsage;
 }
 
 /**
@@ -508,4 +502,3 @@ function handleDomReady() {
 }
 
 document.addEventListener("DOMContentLoaded", handleDomReady);
-

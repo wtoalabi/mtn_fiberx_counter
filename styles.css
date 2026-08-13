@@ -21,6 +21,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 html {
   min-width: 320px;
   background: var(--background);
@@ -725,4 +729,3 @@ h2 {
     grid-template-columns: 1fr;
   }
 }
-
