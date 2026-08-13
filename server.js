@@ -268,7 +268,418 @@ function getCalendarKey(date, granularity) {
  */
 function parseQuotedArguments(argumentText) {
   const matches = argumentText.match(/"((?:\\.|[^"\\])*)"/g) || [];
-  return matches.map((quoted) => quoted.slice(1, -1).replace(/\\x([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16))).replace(/\\"/g, '"').replace(/\\\\/g, "\\"));
+  return matches.map((quoted) => decodeRouterValue(quoted.slice(1, -1)));
+}
+
+/**
+ * Decodes the hexadecimal and escaped characters used in Huawei's generated
+ * JavaScript responses.
+ *
+ * @param {string} value An encoded router string without surrounding quotes.
+ * @returns {string} A readable string value.
+ */
+function decodeRouterValue(value) {
+  return String(value)
+    .replace(/\\x([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)))
+    .replace(/\\(["'\\])/g, "$1")
+    .replace(/\\n/g, "\n")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .trim();
+}
+
+/**
+ * Splits a JavaScript constructor argument list without breaking commas inside
+ * quoted strings or nested arrays.
+ *
+ * @param {string} argumentText Text inside a constructor's parentheses.
+ * @returns {string[]} Raw JavaScript argument values.
+ */
+function splitJavaScriptArguments(argumentText) {
+  const values = [];
+  let current = "";
+  let quote = "";
+  let escaped = false;
+  let nesting = 0;
+
+  for (const character of argumentText) {
+    if (quote) {
+      current += character;
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === quote) {
+        quote = "";
+      }
+      continue;
+    }
+
+    if (character === '"' || character === "'") {
+      quote = character;
+      current += character;
+      continue;
+    }
+    if (character === "[" || character === "{" || character === "(") {
+      nesting += 1;
+    } else if (character === "]" || character === "}" || character === ")") {
+      nesting = Math.max(0, nesting - 1);
+    }
+    if (character === "," && nesting === 0) {
+      values.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += character;
+  }
+
+  if (current.trim() || argumentText.trim().endsWith(",")) {
+    values.push(current.trim());
+  }
+  return values;
+}
+
+/**
+ * Converts a JavaScript literal emitted by the router into a string value for
+ * the dashboard's normalization layer.
+ *
+ * @param {string|undefined} literal A raw constructor argument.
+ * @returns {string} A decoded string, or an empty string for null-like values.
+ */
+function decodeJavaScriptLiteral(literal) {
+  const value = String(literal || "").trim();
+  if (!value || value === "null" || value === "undefined" || value === "NaN") {
+    return "";
+  }
+  if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
+    return decodeRouterValue(value.slice(1, -1));
+  }
+  return decodeRouterValue(value);
+}
+
+/**
+ * Normalizes field names from the router's mixed JavaScript and HTML naming
+ * conventions so aliases such as ReceivingRate and rx_rate can be matched.
+ *
+ * @param {string} fieldName A raw field or column name.
+ * @returns {string} Lowercase alphanumeric field name.
+ */
+function normalizeDeviceFieldName(fieldName) {
+  return String(fieldName || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+/**
+ * Reads the first non-empty value matching a list of normalized field aliases.
+ * Exact aliases win over contains matches to avoid confusing TX and RX fields.
+ *
+ * @param {object} fields Raw field/value pairs.
+ * @param {string[]} aliases Normalized field aliases.
+ * @returns {string} The matched value, or an empty string.
+ */
+function readDeviceField(fields, aliases) {
+  const entries = Object.entries(fields).map(([key, value]) => ({
+    key: normalizeDeviceFieldName(key),
+    value: String(value || "").trim(),
+  }));
+
+  for (const alias of aliases) {
+    const exact = entries.find((entry) => entry.key === alias && entry.value !== "");
+    if (exact) {
+      return exact.value;
+    }
+  }
+  for (const alias of aliases) {
+    const partial = entries.find((entry) => entry.key.includes(alias) && entry.value !== "");
+    if (partial) {
+      return partial.value;
+    }
+  }
+  return "";
+}
+
+/**
+ * Parses an optional numeric field while preserving null for unavailable data.
+ *
+ * @param {string} value A raw numeric field.
+ * @returns {number|null} Parsed number or null when unavailable.
+ */
+function parseOptionalNumber(value) {
+  const match = String(value || "").replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+  return match ? Number(match[0]) : null;
+}
+
+/**
+ * Parses an optional cumulative byte field without turning an unavailable
+ * marker such as -- into a misleading zero.
+ *
+ * @param {string} value A raw byte field.
+ * @returns {string|null} Exact decimal byte string or null.
+ */
+function parseOptionalCounter(value) {
+  return /^\d+$/.test(String(value || "").trim()) ? normalizeCounter(value) : null;
+}
+
+/**
+ * Converts a field map into one safe connected-device record. The record keeps
+ * both negotiated link rates and optional byte counters; many Huawei GPON
+ * firmwares expose the former but not the latter per station.
+ *
+ * @param {object} fields Raw device fields.
+ * @param {string} source Router endpoint that produced the fields.
+ * @param {string} constructorName Optional source constructor name.
+ * @returns {object|null} Normalized device record, or null for non-device rows.
+ */
+function normalizeDeviceRecord(fields, source, constructorName = "") {
+  const mac = readDeviceField(fields, ["macaddress", "hardwareaddress", "mac"]);
+  const ip = readDeviceField(fields, ["ipaddress", "ipv4address", "ip"]);
+  const hostName = readDeviceField(fields, ["hostname", "devicename", "clientname", "friendlyname"]);
+  const genericName = readDeviceField(fields, ["name"]);
+  const name = hostName || genericName || "Unknown device";
+  if (!mac && !ip && name === "Unknown device") {
+    return null;
+  }
+
+  const txRate = readDeviceField(fields, ["sendingrate", "transmitrate", "txrate", "sendrate", "uplinkrate"]);
+  const rxRate = readDeviceField(fields, ["receivingrate", "receiverrate", "rxrate", "receiverate", "downlinkrate"]);
+  const rxBytes = parseOptionalCounter(readDeviceField(fields, ["bytesreceived", "rxbytes", "receivebytes"]));
+  const txBytes = parseOptionalCounter(readDeviceField(fields, ["bytessent", "txbytes", "transmitbytes", "sendbytes"]));
+  const normalizedMac = mac.replace(/-/g, ":").toUpperCase();
+  const identity = normalizedMac || ip || `${name}:${readDeviceField(fields, ["ssidname", "ssid"])}`;
+
+  return {
+    id: identity,
+    name,
+    hostName: hostName || null,
+    mac: normalizedMac || null,
+    ip: ip || null,
+    ssid: readDeviceField(fields, ["ssidname", "ssid"]) || null,
+    connectionType: readDeviceField(fields, ["connectiontype", "networktype", "interfacetype"]) || null,
+    durationSeconds: parseOptionalNumber(readDeviceField(fields, ["connectionduration", "duration", "onlineduration"])),
+    txRateMbps: parseOptionalNumber(txRate),
+    rxRateMbps: parseOptionalNumber(rxRate),
+    signalStrengthDbm: parseOptionalNumber(readDeviceField(fields, ["signalstrength", "rssi"])),
+    noiseDbm: parseOptionalNumber(readDeviceField(fields, ["noise"])),
+    snrDb: parseOptionalNumber(readDeviceField(fields, ["signaltonoiseratio", "snr"])),
+    signalQualityDbm: parseOptionalNumber(readDeviceField(fields, ["signalquality"])),
+    rxBytes,
+    txBytes,
+    source,
+    sourceConstructor: constructorName || null,
+  };
+}
+
+/**
+ * Discovers constructor parameter names in a Huawei JavaScript response so the
+ * parser remains useful across firmware revisions that rename their classes.
+ *
+ * @param {string} payload Raw router response text.
+ * @returns {Map<string,string[]>} Constructor names mapped to parameter names.
+ */
+function getRouterConstructorDefinitions(payload) {
+  const definitions = new Map();
+  for (const match of payload.matchAll(/function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)/g)) {
+    const parameters = splitJavaScriptArguments(match[2]).map((parameter) => parameter.trim()).filter(Boolean);
+    definitions.set(match[1], parameters);
+  }
+  return definitions;
+}
+
+/**
+ * Parses `new SomeHuaweiDevice(...)` calls using the parameter names discovered
+ * in the same response.
+ *
+ * @param {string} payload Raw router response text.
+ * @param {string} source Router endpoint that produced the payload.
+ * @returns {object[]} Parsed device records.
+ */
+function parseRouterConstructorDevices(payload, source) {
+  const records = [];
+  const definitions = getRouterConstructorDefinitions(payload);
+  for (const match of payload.matchAll(/new\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)/g)) {
+    const parameters = definitions.get(match[1]);
+    if (!parameters) {
+      continue;
+    }
+
+    const values = splitJavaScriptArguments(match[2]).map(decodeJavaScriptLiteral);
+    const fields = {};
+    parameters.forEach((parameter, index) => {
+      fields[parameter] = values[index] || "";
+    });
+    const record = normalizeDeviceRecord(fields, source, match[1]);
+    if (record) {
+      records.push(record);
+    }
+  }
+  return records;
+}
+
+/**
+ * Removes markup and script leftovers from an HTML table cell.
+ *
+ * @param {string} value Raw HTML cell contents.
+ * @returns {string} Normalized cell text.
+ */
+function stripRouterMarkup(value) {
+  return decodeRouterValue(String(value || "").replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<[^>]+>/g, " ").replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code))).replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCharCode(Number.parseInt(code, 16))));
+}
+
+/**
+ * Parses rendered-style HTML tables for firmware variants that return device
+ * rows directly instead of JavaScript constructors.
+ *
+ * @param {string} payload Raw router response text.
+ * @param {string} source Router endpoint that produced the payload.
+ * @returns {object[]} Parsed device records.
+ */
+function parseRouterHtmlDevices(payload, source) {
+  const records = [];
+  let headers = null;
+  for (const rowMatch of payload.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)) {
+    const cells = Array.from(rowMatch[1].matchAll(/<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi)).map((cell) => stripRouterMarkup(cell[1]));
+    if (cells.length < 2) {
+      continue;
+    }
+    if (!headers && cells.some((cell) => /mac|ip address|sending rate|receiving rate/i.test(cell))) {
+      headers = cells;
+      continue;
+    }
+    if (!headers) {
+      continue;
+    }
+
+    const fields = {};
+    headers.forEach((header, index) => {
+      fields[header] = cells[index] || "";
+    });
+    const record = normalizeDeviceRecord(fields, source, "html-table");
+    if (record) {
+      records.push(record);
+    }
+  }
+  return records;
+}
+
+/**
+ * Recursively extracts device-shaped objects from JSON responses used by some
+ * Huawei firmware builds.
+ *
+ * @param {unknown} value Parsed JSON value.
+ * @param {object[]} records Accumulator for normalized records.
+ * @param {string} source Router endpoint that produced the payload.
+ * @returns {void}
+ */
+function collectJsonDeviceObjects(value, records, source) {
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectJsonDeviceObjects(item, records, source));
+    return;
+  }
+  if (!value || typeof value !== "object") {
+    return;
+  }
+
+  const record = normalizeDeviceRecord(value, source, "json");
+  if (record) {
+    records.push(record);
+  }
+  Object.values(value).forEach((child) => collectJsonDeviceObjects(child, records, source));
+}
+
+/**
+ * Parses one candidate router response through JSON, constructor, and HTML
+ * strategies, then de-duplicates devices by MAC or IP address.
+ *
+ * @param {string} payload Raw router response text.
+ * @param {string} source Router endpoint that produced the payload.
+ * @returns {object[]} Normalized connected-device records.
+ */
+function parseDevicePayload(payload, source) {
+  const records = [];
+  const trimmed = payload.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      collectJsonDeviceObjects(JSON.parse(trimmed), records, source);
+    } catch (error) {
+      // Huawei firmware frequently wraps JSON-like data in JavaScript; the
+      // constructor and HTML parsers below handle those responses instead.
+    }
+  }
+  records.push(...parseRouterConstructorDevices(payload, source));
+  records.push(...parseRouterHtmlDevices(payload, source));
+  return mergeDeviceRecords(records);
+}
+
+/**
+ * Merges identity rows and WLAN rate rows for the same station without
+ * replacing useful values with nulls from a less-detailed endpoint.
+ *
+ * @param {object[]} records Device records from one or more router endpoints.
+ * @returns {object[]} De-duplicated device records.
+ */
+function mergeDeviceRecords(records) {
+  const merged = new Map();
+  records.forEach((record) => {
+    const key = record.mac || record.ip || record.id;
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, { ...record });
+      return;
+    }
+
+    Object.keys(existing).forEach((field) => {
+      const current = existing[field];
+      const incoming = record[field];
+      const currentMissing = current === null || current === "" || typeof current === "undefined";
+      if (currentMissing && incoming !== null && incoming !== "" && typeof incoming !== "undefined") {
+        existing[field] = incoming;
+      }
+    });
+  });
+  return Array.from(merged.values());
+}
+
+/**
+ * Queries the firmware's LAN/WLAN device resources, choosing the first working
+ * resource in each group so identity and Wi-Fi rate data can be combined.
+ *
+ * @returns {Promise<{devices:object[],source:string|null,usageAvailable:boolean,error:string|null}>} Device snapshot.
+ */
+async function queryRouterDevices() {
+  const records = [];
+  const sources = [];
+
+  for (const group of DEVICE_ENDPOINT_GROUPS) {
+    for (const endpoint of group.paths) {
+      let response;
+      try {
+        response = await requestRouter(endpoint, { timeoutMs: 5_000 });
+      } catch (error) {
+        if (String(error.message).includes("reset the connection")) {
+          throw error;
+        }
+        continue;
+      }
+      if (response.statusCode >= 400 || isRouterLoginPage(response.body)) {
+        continue;
+      }
+
+      const parsed = parseDevicePayload(response.body, endpoint);
+      if (parsed.length > 0) {
+        records.push(...parsed);
+        sources.push(endpoint);
+        break;
+      }
+    }
+  }
+
+  const devices = mergeDeviceRecords(records);
+  return {
+    devices,
+    source: sources.length ? sources.join(" + ") : null,
+    usageAvailable: devices.some((device) => device.rxBytes !== null || device.txBytes !== null),
+    error: devices.length ? null : "This router returned no compatible connected-device rows.",
+  };
 }
 
 /**
