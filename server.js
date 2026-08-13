@@ -753,13 +753,14 @@ function getRouterCookieHeader() {
  * router URL because Huawei's embedded UI commonly uses a self-signed cert.
  *
  * @param {string} pathname Router-relative path to request.
- * @param {{method?:string,body?:string,headers?:object}} options Request options.
+ * @param {{method?:string,body?:string,headers?:object,timeoutMs?:number}} options Request options.
  * @returns {Promise<{statusCode:number,headers:object,body:string}>} Raw response.
  */
 function requestRouter(pathname, options = {}) {
   const config = getConfig();
   const target = new URL(pathname, config.routerUrl);
   const body = options.body || "";
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 10_000;
   const headers = {
     Accept: "*/*",
     Connection: "close",
@@ -801,7 +802,7 @@ function requestRouter(pathname, options = {}) {
       }));
     });
 
-    request.setTimeout(10_000, () => request.destroy(new Error("Router request timed out.")));
+    request.setTimeout(timeoutMs, () => request.destroy(new Error("Router request timed out.")));
     request.on("error", (error) => reject(formatRouterRequestError(pathname, error)));
     if (body) {
       request.write(body);
@@ -1041,6 +1042,11 @@ function buildSummary(store, monthKey) {
     lastSyncAt: store.lastRouter?.capturedAt || null,
     baselineAt: store.baseline?.capturedAt || null,
     settings: store.settings,
+    devices: store.lastDevices?.devices || [],
+    deviceSource: store.lastDevices?.source || null,
+    deviceUsageAvailable: Boolean(store.lastDevices?.usageAvailable),
+    deviceLastSyncAt: store.lastDevices?.capturedAt || null,
+    deviceError: store.lastDevices?.error || null,
     router: getPublicRouterStatus(store.lastRouter),
   };
 }
@@ -1071,6 +1077,17 @@ async function collectSnapshot() {
 async function collectSnapshotInternal() {
   const store = await readUsageStore();
   const stats = await getRouterStats();
+  let deviceSnapshot;
+  try {
+    deviceSnapshot = await queryRouterDevices();
+  } catch (error) {
+    deviceSnapshot = {
+      devices: store.lastDevices?.devices || [],
+      source: store.lastDevices?.source || null,
+      usageAvailable: Boolean(store.lastDevices?.usageAvailable),
+      error: error instanceof Error ? error.message : "Connected-device data could not be read.",
+    };
+  }
   const capturedAt = new Date();
   const day = getCalendarKey(capturedAt, "day");
   const month = getCalendarKey(capturedAt, "month");
@@ -1102,6 +1119,13 @@ async function collectSnapshotInternal() {
     connected: true,
     capturedAt: capturedAt.toISOString(),
     model: "HG8145X7-10",
+  };
+  store.lastDevices = {
+    capturedAt: capturedAt.toISOString(),
+    devices: deviceSnapshot.devices,
+    source: deviceSnapshot.source,
+    usageAvailable: deviceSnapshot.usageAvailable,
+    error: deviceSnapshot.error || null,
   };
   store.samples.push(sample);
   await persistUsageStore(store);
