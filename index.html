@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#050505" />
+    <meta
+      name="description"
+      content="A local MTN FiberX data tracker backed by Huawei WAN counters."
+    />
+    <title>MTN FiberX Data Tracker</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-lockup">
+          <div class="brand-badge">MTN 5G</div>
+          <div>
+            <p class="brand-kicker">LOCAL ROUTER MONITOR</p>
+            <h1>MTN FiberX Data Tracker</h1>
+            <p class="router-caption" id="router-caption">
+              HG8145X7-10 <span aria-hidden="true">·</span> 192.168.100.1
+            </p>
+          </div>
+        </div>
+
+        <div class="toolbar" aria-label="Dashboard controls">
+          <label class="month-control" for="month-selector">
+            <span class="sr-only">Select month</span>
+            <select id="month-selector" name="month"></select>
+          </label>
+          <button class="button button-secondary" id="sync-button" type="button">
+            <span class="status-dot" id="sync-dot" aria-hidden="true"></span>
+            <span id="sync-label">Sync Router</span>
+          </button>
+          <button class="button button-primary" id="export-button" type="button">
+            Export CSV
+          </button>
+        </div>
+      </header>
+
+      <main>
+        <div class="status-message" id="status-message" role="status" aria-live="polite"></div>
+
+        <section class="metric-grid" aria-label="Usage summary">
+          <article class="metric-card">
+            <p class="metric-label">Total usage this month</p>
+            <p class="metric-value" id="total-usage">--</p>
+            <p class="metric-detail" id="total-detail">Waiting for router sync</p>
+          </article>
+
+          <article class="metric-card metric-card-accent">
+            <p class="metric-label">Latest day usage</p>
+            <p class="metric-value" id="latest-usage">--</p>
+            <p class="metric-detail" id="latest-detail">No usage day recorded</p>
+          </article>
+
+          <article class="metric-card">
+            <p class="metric-label">Daily average</p>
+            <p class="metric-value" id="daily-average">--</p>
+            <p class="metric-detail" id="projection-detail">Projected: --</p>
+          </article>
+
+          <article class="metric-card">
+            <p class="metric-label">Plan status / pace</p>
+            <p class="metric-value" id="plan-status">--</p>
+            <p class="metric-detail" id="plan-detail">Configure your plan below</p>
+          </article>
+        </section>
+
+        <section class="plan-banner panel" aria-label="Plan progress">
+          <div class="plan-banner-copy">
+            <h2 id="plan-banner-title">Unlimited data plan active</h2>
+            <p id="plan-banner-subtitle">Sync the router to begin recording daily usage.</p>
+          </div>
+          <span class="plan-chip" id="plan-chip">UNLIMITED</span>
+          <div class="plan-progress-track" aria-hidden="true">
+            <div class="plan-progress-fill" id="plan-progress-fill"></div>
+          </div>
+        </section>
+
+        <section class="content-grid">
+          <article class="panel chart-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="panel-eyebrow">Usage history</p>
+                <h2>Daily consumption trend</h2>
+              </div>
+              <span class="panel-unit">GB / DAY</span>
+            </div>
+            <div class="chart-shell" id="chart-shell" aria-label="Daily usage chart">
+              <div class="chart-y-axis" id="chart-y-axis" aria-hidden="true"></div>
+              <div class="chart-plot">
+                <div class="chart-bars" id="chart-bars"></div>
+                <div class="chart-empty" id="chart-empty">
+                  <span class="chart-empty-icon">↗</span>
+                  <span>Daily bars will appear after the second sync.</span>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <aside class="panel settings-panel">
+            <div class="panel-heading compact-heading">
+              <div>
+                <p class="panel-eyebrow">Configuration</p>
+                <h2>Plan settings</h2>
+              </div>
+            </div>
+
+            <div class="segmented-control" role="radiogroup" aria-label="Plan type">
+              <label class="segment-option">
+                <input type="radio" name="plan-mode" value="unlimited" checked />
+                <span>Unlimited (ODU / FiberX)</span>
+              </label>
+              <label class="segment-option">
+                <input type="radio" name="plan-mode" value="capped" />
+                <span>Capped plan</span>
+              </label>
+            </div>
+
+            <label class="field-label" for="cap-gb">Monthly cap (GB)</label>
+            <input class="text-input" id="cap-gb" type="number" min="1" step="1" value="500" disabled />
+
+            <label class="field-label" for="billing-day">Billing cycle start day</label>
+            <input class="text-input" id="billing-day" type="number" min="1" max="28" step="1" value="1" />
+
+            <button class="button button-full" id="save-settings" type="button">Save settings</button>
+            <p class="settings-feedback" id="settings-feedback" role="status" aria-live="polite"></p>
+
+            <div class="settings-stats">
+              <div class="settings-stat">
+                <span>Burn rate</span>
+                <strong id="burn-rate">--</strong>
+              </div>
+              <div class="settings-stat">
+                <span>Projected month end</span>
+                <strong id="projected-end">--</strong>
+              </div>
+              <div class="settings-stat">
+                <span>Latest day</span>
+                <strong id="settings-latest-day">--</strong>
+              </div>
+            </div>
+          </aside>
+        </section>
+
+        <section class="bottom-grid">
+          <article class="panel telemetry-panel">
+            <div class="panel-heading compact-heading">
+              <div>
+                <p class="panel-eyebrow">Source counters</p>
+                <h2>Router telemetry</h2>
+              </div>
+              <span class="live-label"><span class="status-dot"></span> LOCAL</span>
+            </div>
+            <div class="telemetry-grid">
+              <div class="telemetry-item">
+                <span class="telemetry-label">RX / download counter</span>
+                <strong id="rx-counter">--</strong>
+              </div>
+              <div class="telemetry-item">
+                <span class="telemetry-label">TX / upload counter</span>
+                <strong id="tx-counter">--</strong>
+              </div>
+              <div class="telemetry-item">
+                <span class="telemetry-label">Last router sync</span>
+                <strong id="last-sync">--</strong>
+              </div>
+              <div class="telemetry-item">
+                <span class="telemetry-label">Baseline</span>
+                <strong id="baseline-time">--</strong>
+              </div>
+            </div>
+            <p class="telemetry-note">
+              Usage is the delta between cumulative WAN counters. Keep the local server running to build a day-by-day history.
+            </p>
+          </article>
+
+          <article class="panel how-it-works-panel">
+            <p class="panel-eyebrow">How this replica works</p>
+            <h2>Real counters, local history</h2>
+            <p>
+              The Huawei interface exposes cumulative PPPoE RX/TX bytes, but not a monthly history. This tracker samples those counters and stores only the deltas on this Mac.
+            </p>
+            <div class="source-pill">HG8145X7-10 · WAN PPP statistics</div>
+          </article>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>
+
