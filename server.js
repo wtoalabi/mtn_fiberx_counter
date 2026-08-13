@@ -850,7 +850,12 @@ function formatRouterRequestError(pathname, error) {
  * @returns {boolean} Whether the body looks like the login screen.
  */
 function isRouterLoginPage(body) {
-  return body.includes('id="txt_Username"') || body.includes("Welcome to Huawei web page");
+  const normalizedBody = body.toLowerCase();
+
+  return normalizedBody.includes('id="txt_username"')
+    || normalizedBody.includes("welcome to huawei web page")
+    || normalizedBody.includes("<title>waiting...</title>")
+    || normalizedBody.includes("top.location.replace");
 }
 
 /**
@@ -881,6 +886,10 @@ async function loginToRouter() {
 
     const tokenResponse = await requestRouter("/asp/GetRandCount.asp", { method: "POST" });
     const token = tokenResponse.body.trim();
+    if (tokenResponse.statusCode >= 400 || isRouterLoginPage(tokenResponse.body) || !token) {
+      throw new Error("The router did not provide a login token. Wait for the router lockout to clear and try again.");
+    }
+
     const form = new URLSearchParams({
       UserName: config.routerUsername,
       PassWord: Buffer.from(config.routerPassword, "utf8").toString("base64"),
@@ -894,7 +903,7 @@ async function loginToRouter() {
     });
 
     if (loginResponse.statusCode >= 400 || isRouterLoginPage(loginResponse.body)) {
-      throw new Error("The router login was rejected. Check the local router settings.");
+      throw new Error("The router login was rejected. Verify ROUTER_USERNAME and ROUTER_PASSWORD in .env, then wait for any Huawei lockout timer to clear.");
     }
 
     routerSession.loggedIn = true;
