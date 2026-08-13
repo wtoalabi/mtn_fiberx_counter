@@ -853,8 +853,22 @@ function isRouterLoginPage(body) {
   const normalizedBody = body.toLowerCase();
 
   return normalizedBody.includes('id="txt_username"')
-    || normalizedBody.includes("welcome to huawei web page")
-    || normalizedBody.includes("<title>waiting...</title>")
+    || normalizedBody.includes("welcome to huawei web page");
+}
+
+/**
+ * Returns true when Huawei has sent its short intermediate page that redirects
+ * the browser back to the root page after login or after an unauthenticated
+ * request. This is deliberately separate from the login form because Huawei
+ * also uses the same page as the normal successful login response.
+ *
+ * @param {string} body Raw router response body.
+ * @returns {boolean} Whether the body is Huawei's intermediate redirect page.
+ */
+function isRouterWaitingPage(body) {
+  const normalizedBody = body.toLowerCase();
+
+  return normalizedBody.includes("<title>waiting...</title>")
     || normalizedBody.includes("top.location.replace");
 }
 
@@ -936,10 +950,10 @@ async function queryRouterStats() {
       failures.push(`${endpoint}: ${error.message}`);
       continue;
     }
-    if (response.statusCode >= 400 || isRouterLoginPage(response.body)) {
-      if (isRouterLoginPage(response.body)) {
+    if (response.statusCode >= 400 || isRouterLoginPage(response.body) || isRouterWaitingPage(response.body)) {
+      if (isRouterLoginPage(response.body) || isRouterWaitingPage(response.body)) {
         loginRequired = true;
-        failures.push(`${endpoint}: login page returned`);
+        failures.push(`${endpoint}: unauthenticated redirect returned`);
       } else {
         failures.push(`${endpoint}: HTTP ${response.statusCode}`);
       }
