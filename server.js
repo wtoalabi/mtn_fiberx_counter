@@ -10,7 +10,11 @@ const { URL } = require("node:url");
 const ROOT_DIRECTORY = __dirname;
 const DATA_DIRECTORY = path.join(ROOT_DIRECTORY, "data");
 const DATA_FILE = path.join(DATA_DIRECTORY, "usage.json");
-const routerSession = { cookies: new Map(), loggedIn: false };
+const routerSession = {
+  cookies: new Map(),
+  loggedIn: false,
+  authBlockedUntil: 0,
+};
 let cachedConfig = null;
 let collectionPromise = null;
 let persistenceQueue = Promise.resolve();
@@ -323,13 +327,18 @@ function requestRouter(pathname, options = {}) {
   const config = getConfig();
   const target = new URL(pathname, config.routerUrl);
   const body = options.body || "";
-  const headers = { ...(options.headers || {}) };
+  const headers = {
+    Accept: "*/*",
+    Connection: "close",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 FiberXTracker/1.0",
+    ...(options.headers || {}),
+  };
   const cookieHeader = getRouterCookieHeader();
 
   if (cookieHeader) {
     headers.Cookie = cookieHeader;
   }
-  if (body && !headers["Content-Length"]) {
+  if (options.method && options.method !== "GET" && !headers["Content-Length"]) {
     headers["Content-Length"] = Buffer.byteLength(body);
   }
 
@@ -341,6 +350,7 @@ function requestRouter(pathname, options = {}) {
     method: options.method || "GET",
     path: `${target.pathname}${target.search}`,
     headers,
+    agent: false,
   };
   if (target.protocol === "https:") {
     requestOptions.rejectUnauthorized = !config.allowInsecureTls;
@@ -359,12 +369,31 @@ function requestRouter(pathname, options = {}) {
     });
 
     request.setTimeout(10_000, () => request.destroy(new Error("Router request timed out.")));
-    request.on("error", reject);
+    request.on("error", (error) => reject(formatRouterRequestError(pathname, error)));
     if (body) {
       request.write(body);
     }
     request.end();
   });
+}
+
+/**
+ * Converts low-level socket failures into an actionable message while keeping
+ * the original router path visible for diagnosis. Huawei ONT web servers often
+ * reset a connection during a login lockout or when a stale keep-alive socket
+ * is reused, so the client explicitly closes each request after this change.
+ *
+ * @param {string} pathname Router-relative path that failed.
+ * @param {Error & {code?:string}} error Low-level request error.
+ * @returns {Error} A user-facing router request error.
+ */
+function formatRouterRequestError(pathname, error) {
+  const resetCodes = new Set(["ECONNRESET", "EPIPE", "ERR_STREAM_WRITE_AFTER_END"]);
+  if (resetCodes.has(error.code) || error.message === "socket hang up") {
+    return new Error(`The router reset the connection while requesting ${pathname}. It may be temporarily locked or the credentials in .env may be invalid.`);
+  }
+
+  return new Error(`Router request to ${pathname} failed: ${error.message}`);
 }
 
 /**
@@ -391,30 +420,45 @@ async function loginToRouter() {
     throw new Error("Set ROUTER_PASSWORD before starting the tracker.");
   }
 
-  routerSession.cookies.clear();
-  routerSession.loggedIn = false;
-  await requestRouter("/");
-  routerSession.cookies.set("Cookie", "body:Language:english:id=-1");
-
-  const tokenResponse = await requestRouter("/asp/GetRandCount.asp", { method: "POST" });
-  const token = tokenResponse.body.trim();
-  const form = new URLSearchParams({
-    UserName: config.routerUsername,
-    PassWord: Buffer.from(config.routerPassword, "utf8").toString("base64"),
-    Language: "english",
-    "x.X_HW_Token": token,
-  });
-  const loginResponse = await requestRouter("/login.cgi", {
-    method: "POST",
-    body: form.toString(),
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  });
-
-  if (loginResponse.statusCode >= 400 || isRouterLoginPage(loginResponse.body)) {
-    throw new Error("The router login was rejected. Check the local router settings.");
+  const waitMilliseconds = routerSession.authBlockedUntil - Date.now();
+  if (waitMilliseconds > 0) {
+    const waitSeconds = Math.ceil(waitMilliseconds / 1000);
+    throw new Error(`Router login is paused for ${waitSeconds}s after a failed attempt. Check .env and wait for the router lockout to clear.`);
   }
 
-  routerSession.loggedIn = true;
+  routerSession.cookies.clear();
+  routerSession.loggedIn = false;
+
+  try {
+    await requestRouter("/");
+    routerSession.cookies.set("Cookie", "body:Language:english:id=-1");
+
+    const tokenResponse = await requestRouter("/asp/GetRandCount.asp", { method: "POST" });
+    const token = tokenResponse.body.trim();
+    const form = new URLSearchParams({
+      UserName: config.routerUsername,
+      PassWord: Buffer.from(config.routerPassword, "utf8").toString("base64"),
+      Language: "english",
+      "x.X_HW_Token": token,
+    });
+    const loginResponse = await requestRouter("/login.cgi", {
+      method: "POST",
+      body: form.toString(),
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+
+    if (loginResponse.statusCode >= 400 || isRouterLoginPage(loginResponse.body)) {
+      throw new Error("The router login was rejected. Check the local router settings.");
+    }
+
+    routerSession.loggedIn = true;
+    routerSession.authBlockedUntil = 0;
+  } catch (error) {
+    routerSession.loggedIn = false;
+    routerSession.cookies.clear();
+    routerSession.authBlockedUntil = Date.now() + 300_000;
+    throw error;
+  }
 }
 
 /**
@@ -827,4 +871,3 @@ function startServer() {
 }
 
 startServer();
-
