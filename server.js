@@ -10,6 +10,26 @@ const { URL } = require("node:url");
 const ROOT_DIRECTORY = __dirname;
 const DATA_DIRECTORY = path.join(ROOT_DIRECTORY, "data");
 const DATA_FILE = path.join(DATA_DIRECTORY, "usage.json");
+const DEVICE_ENDPOINT_GROUPS = [
+  {
+    name: "LAN/WLAN device list",
+    paths: [
+      "/html/bbsp/common/GetLanUserDevInfo.asp",
+      "/html/bbsp/common/GetLanUserDhcpInfo.asp",
+      "/html/bbsp/common/lanuserinfo.asp",
+      "/html/bbsp/common/dhcpinfo.asp",
+    ],
+  },
+  {
+    name: "WLAN station rates",
+    paths: [
+      "/html/AllUsers/html/amp/wlaninfo/getassociateddeviceinfo.asp",
+      "/html/amp/wlaninfo/getassociateddeviceinfo.asp",
+      "/html/bbsp/status/wlaninfo.asp",
+      "/html/status/wlaninfo.asp",
+    ],
+  },
+];
 const routerSession = {
   cookies: new Map(),
   loggedIn: false,
@@ -100,6 +120,7 @@ function createEmptyStore() {
     baseline: null,
     lastCounters: null,
     lastRouter: null,
+    lastDevices: null,
     samples: [],
   };
 }
@@ -126,6 +147,7 @@ function normalizeStore(candidate) {
     baseline: source.baseline && typeof source.baseline === "object" ? source.baseline : null,
     lastCounters: source.lastCounters && typeof source.lastCounters === "object" ? source.lastCounters : null,
     lastRouter: source.lastRouter && typeof source.lastRouter === "object" ? source.lastRouter : null,
+    lastDevices: source.lastDevices && typeof source.lastDevices === "object" ? source.lastDevices : null,
     samples: Array.isArray(source.samples) ? source.samples : [],
   };
 }
