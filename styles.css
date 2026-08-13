@@ -751,6 +751,11 @@ h2 {
   font-weight: 700;
 }
 
+.device-usage-value {
+  color: var(--text) !important;
+  font-weight: 700;
+}
+
 .device-usage-unavailable {
   color: var(--dim);
   font-size: 11px;

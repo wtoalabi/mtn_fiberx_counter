@@ -713,10 +713,121 @@ function mergeDeviceRecords(records) {
 }
 
 /**
+ * Determines whether a router field is an exact cumulative byte counter rather
+ * than an unavailable marker or a value that was normalized to zero.
+ *
+ * @param {unknown} value A normalized device counter field.
+ * @returns {boolean} Whether the field contains a usable decimal counter.
+ */
+function isDeviceCounter(value) {
+  return value !== null && typeof value !== "undefined" && /^\d+$/.test(String(value));
+}
+
+/**
+ * Reports which byte directions are available for one connected device.
+ * Huawei firmware can expose one direction without exposing the other, so the
+ * collector tracks each direction independently instead of discarding partial
+ * telemetry.
+ *
+ * @param {object} device A normalized connected-device record.
+ * @returns {{hasRx:boolean,hasTx:boolean}} Available counter directions.
+ */
+function getDeviceCounterAvailability(device) {
+  return {
+    hasRx: isDeviceCounter(device?.rxBytes),
+    hasTx: isDeviceCounter(device?.txBytes),
+  };
+}
+
+/**
+ * Converts the live per-device counters into interval usage rows. The first
+ * counter seen for a device establishes a baseline; later samples use exact
+ * RX/TX deltas and handle counter resets without generating negative usage.
+ *
+ * @param {object} store The mutable persisted usage store.
+ * @param {object[]} devices The freshly sampled device records.
+ * @param {Date} capturedAt Timestamp shared by the router snapshot.
+ * @returns {void}
+ */
+function recordDeviceUsageSamples(store, devices, capturedAt) {
+  const previousDevices = new Map((store.lastDevices?.devices || []).map((device) => [device.id, device]));
+  const day = getCalendarKey(capturedAt, "day");
+  const month = getCalendarKey(capturedAt, "month");
+
+  devices.forEach((device) => {
+    const availability = getDeviceCounterAvailability(device);
+    if (!availability.hasRx && !availability.hasTx) {
+      return;
+    }
+
+    const previous = previousDevices.get(device.id);
+    const previousAvailability = getDeviceCounterAvailability(previous || {});
+    const rxDelta = availability.hasRx
+      ? (previousAvailability.hasRx ? calculateCounterDelta(device.rxBytes, previous.rxBytes) : { delta: "0", reset: false })
+      : { delta: "0", reset: false };
+    const txDelta = availability.hasTx
+      ? (previousAvailability.hasTx ? calculateCounterDelta(device.txBytes, previous.txBytes) : { delta: "0", reset: false })
+      : { delta: "0", reset: false };
+
+    store.deviceUsageSamples.push({
+      capturedAt: capturedAt.toISOString(),
+      day,
+      month,
+      deviceId: device.id,
+      name: device.name,
+      mac: device.mac,
+      ip: device.ip,
+      rxDeltaBytes: rxDelta.delta,
+      txDeltaBytes: txDelta.delta,
+      usageBytes: addCounterStrings(rxDelta.delta, txDelta.delta),
+      counterReset: Boolean(rxDelta.reset || txDelta.reset),
+      baseline: !(previousAvailability.hasRx && availability.hasRx)
+        && !(previousAvailability.hasTx && availability.hasTx),
+    });
+  });
+}
+
+/**
+ * Aggregates stored per-device interval rows for the selected calendar month.
+ * The result is keyed by the stable device identity so the live device list can
+ * display a monthly value without exposing raw router counters to the user.
+ *
+ * @param {object} store The normalized persisted usage store.
+ * @param {string} monthKey A YYYY-MM calendar month key.
+ * @returns {Record<string,object>} Monthly usage summaries keyed by device ID.
+ */
+function buildDeviceUsageSummary(store, monthKey) {
+  const usageByDevice = new Map();
+  const samples = Array.isArray(store.deviceUsageSamples) ? store.deviceUsageSamples : [];
+
+  samples.filter((sample) => sample.month === monthKey).forEach((sample) => {
+    const current = usageByDevice.get(sample.deviceId) || {
+      usageBytes: "0",
+      rxUsageBytes: "0",
+      txUsageBytes: "0",
+      sampleCount: 0,
+      baselineOnly: true,
+      latestCapturedAt: null,
+    };
+    current.usageBytes = addCounterStrings(current.usageBytes, sample.usageBytes);
+    current.rxUsageBytes = addCounterStrings(current.rxUsageBytes, sample.rxDeltaBytes);
+    current.txUsageBytes = addCounterStrings(current.txUsageBytes, sample.txDeltaBytes);
+    current.sampleCount += 1;
+    current.baselineOnly = current.baselineOnly && Boolean(sample.baseline);
+    if (!current.latestCapturedAt || sample.capturedAt > current.latestCapturedAt) {
+      current.latestCapturedAt = sample.capturedAt;
+    }
+    usageByDevice.set(sample.deviceId, current);
+  });
+
+  return Object.fromEntries(usageByDevice.entries());
+}
+
+/**
  * Queries the firmware's LAN/WLAN device resources, choosing the first working
  * resource in each group so identity and Wi-Fi rate data can be combined.
  *
- * @returns {Promise<{devices:object[],source:string|null,usageAvailable:boolean,error:string|null}>} Device snapshot.
+ * @returns {Promise<{devices:object[],source:string|null,usageAvailable:boolean,error:string|null,sampled:boolean}>} Device snapshot.
  */
 async function queryRouterDevices() {
   const records = [];
@@ -750,8 +861,12 @@ async function queryRouterDevices() {
   return {
     devices,
     source: sources.length ? sources.join(" + ") : null,
-    usageAvailable: devices.some((device) => device.rxBytes !== null || device.txBytes !== null),
+    usageAvailable: devices.some((device) => {
+      const availability = getDeviceCounterAvailability(device);
+      return availability.hasRx || availability.hasTx;
+    }),
     error: devices.length ? null : "This router returned no compatible connected-device rows.",
+    sampled: true,
   };
 }
 
@@ -1133,6 +1248,7 @@ function getDaysInMonth(monthKey) {
  */
 function buildSummary(store, monthKey) {
   const filteredSamples = store.samples.filter((sample) => sample.month === monthKey);
+  const deviceUsageSummary = buildDeviceUsageSummary(store, monthKey);
   const dailyMap = new Map();
 
   filteredSamples.forEach((sample) => {
@@ -1164,11 +1280,15 @@ function buildSummary(store, monthKey) {
     lastSyncAt: store.lastRouter?.capturedAt || null,
     baselineAt: store.baseline?.capturedAt || null,
     settings: store.settings,
-    devices: store.lastDevices?.devices || [],
+    devices: (store.lastDevices?.devices || []).map((device) => ({
+      ...device,
+      deviceUsage: deviceUsageSummary[device.id] || null,
+    })),
     deviceSource: store.lastDevices?.source || null,
     deviceUsageAvailable: Boolean(store.lastDevices?.usageAvailable),
     deviceLastSyncAt: store.lastDevices?.capturedAt || null,
     deviceError: store.lastDevices?.error || null,
+    pollIntervalSeconds: Math.round(getConfig().collectionIntervalMs / 1_000),
     router: getPublicRouterStatus(store.lastRouter),
   };
 }
@@ -1208,6 +1328,7 @@ async function collectSnapshotInternal() {
       source: store.lastDevices?.source || null,
       usageAvailable: Boolean(store.lastDevices?.usageAvailable),
       error: error instanceof Error ? error.message : "Connected-device data could not be read.",
+      sampled: false,
     };
   }
   const capturedAt = new Date();
@@ -1228,6 +1349,10 @@ async function collectSnapshotInternal() {
     counterReset: Boolean(previous && (rxDelta.reset || txDelta.reset)),
     sampleCount: stats.records.length,
   };
+
+  if (deviceSnapshot.sampled) {
+    recordDeviceUsageSamples(store, deviceSnapshot.devices, capturedAt);
+  }
 
   if (!store.baseline) {
     store.baseline = {
@@ -1431,6 +1556,45 @@ async function handleRequest(request, response) {
 }
 
 /**
+ * Runs one background router collection without allowing a transient router
+ * failure to terminate the long-lived local server. Repeated identical errors
+ * are logged once until a successful sample clears the condition.
+ *
+ * @returns {Promise<void>} Resolves after the background attempt is handled.
+ */
+async function runBackgroundCollection() {
+  try {
+    await collectSnapshot();
+    lastBackgroundCollectionError = null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Background router sync failed.";
+    if (message !== lastBackgroundCollectionError) {
+      console.error(`Background router sync failed: ${message}`);
+      lastBackgroundCollectionError = message;
+    }
+  }
+}
+
+/**
+ * Starts the server-owned collection timer so usage history continues to build
+ * when no dashboard tab is open. The timer is intentionally kept on the server
+ * rather than the browser because a closed tab cannot reliably poll the router.
+ *
+ * @returns {void}
+ */
+function startBackgroundCollection() {
+  if (backgroundCollectionTimer) {
+    return;
+  }
+
+  const config = getConfig();
+  void runBackgroundCollection();
+  backgroundCollectionTimer = setInterval(() => {
+    void runBackgroundCollection();
+  }, config.collectionIntervalMs);
+}
+
+/**
  * Starts the local-only HTTP server and prints only non-sensitive connection
  * information for the operator.
  *
@@ -1445,6 +1609,8 @@ function startServer() {
   server.listen(config.port, config.host, () => {
     console.log(`FiberX tracker: http://${config.host}:${config.port}`);
     console.log(`Router source: ${config.routerUrl.origin}`);
+    console.log(`Background collection interval: ${config.collectionIntervalMs / 1_000}s`);
+    startBackgroundCollection();
   });
   return server;
 }

@@ -154,7 +154,7 @@
                 <p class="panel-eyebrow">Source counters</p>
                 <h2>Router telemetry</h2>
               </div>
-              <span class="live-label"><span class="status-dot"></span> LOCAL</span>
+              <span class="live-label"><span class="status-dot"></span> LOCAL · 30 SEC POLL</span>
             </div>
             <div class="telemetry-grid">
               <div class="telemetry-item">
@@ -174,7 +174,7 @@
                 <strong id="baseline-time">--</strong>
               </div>
             </div>
-            <p class="telemetry-note">
+            <p class="telemetry-note" id="telemetry-note">
               Usage is the delta between cumulative WAN counters. Keep the local server running to build a day-by-day history.
             </p>
           </article>
@@ -183,7 +183,7 @@
             <p class="panel-eyebrow">How this replica works</p>
             <h2>Real counters, local history</h2>
             <p>
-              The Huawei interface exposes cumulative PPPoE RX/TX bytes, but not a monthly history. This tracker samples those counters and stores only the deltas on this Mac.
+              The Huawei interface exposes cumulative PPPoE RX/TX bytes, but not a monthly history. This tracker samples those counters every 30 seconds and stores only the deltas on this Mac, even when the dashboard tab is closed.
             </p>
             <div class="source-pill">HG8145X7-10 · WAN PPP statistics</div>
           </article>
@@ -198,7 +198,7 @@
             <span class="device-count" id="device-count">--</span>
           </div>
           <p class="device-note" id="device-note">
-            The router reports negotiated Wi-Fi link rates per device. Per-device byte counters are shown only if this firmware exposes them.
+            The router reports device identity and negotiated Wi-Fi link details. Per-device byte usage is shown only if this firmware exposes byte counters.
           </p>
           <div class="device-table-wrap">
             <table class="device-table">
@@ -210,7 +210,7 @@
                   <th scope="col">RX link</th>
                   <th scope="col">TX link</th>
                   <th scope="col">Signal</th>
-                  <th scope="col">Usage</th>
+                  <th scope="col">Usage (month)</th>
                 </tr>
               </thead>
               <tbody id="device-rows"></tbody>

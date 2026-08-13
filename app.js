@@ -1,5 +1,7 @@
 "use strict";
 
+const AUTOMATIC_REFRESH_INTERVAL_MS = 30_000;
+
 /**
  * Holds the browser-side view state for the selected month and the most recent
  * response from the local collector. The router password never enters this
@@ -54,6 +56,7 @@ function getDashboardElements() {
     txCounter: document.getElementById("tx-counter"),
     lastSync: document.getElementById("last-sync"),
     baselineTime: document.getElementById("baseline-time"),
+    telemetryNote: document.getElementById("telemetry-note"),
     deviceCount: document.getElementById("device-count"),
     deviceNote: document.getElementById("device-note"),
     deviceRows: document.getElementById("device-rows"),
@@ -232,7 +235,13 @@ function formatDeviceDuration(seconds) {
  * @returns {string} A link-rate label.
  */
 function formatDeviceRate(rateMbps) {
-  return Number.isFinite(Number(rateMbps)) ? `${Math.round(Number(rateMbps))} Mbps` : "--";
+  const value = Number(rateMbps);
+  if (!Number.isFinite(value)) {
+    return "--";
+  }
+
+  const decimals = value < 1 ? 2 : value < 10 ? 1 : 0;
+  return `${value.toFixed(decimals)} Mbps`;
 }
 
 /**
@@ -262,10 +271,24 @@ function formatDeviceSignal(device) {
  */
 function createDeviceUsageCell(device) {
   const cell = document.createElement("td");
-  const hasRx = device.rxBytes !== null && typeof device.rxBytes !== "undefined";
-  const hasTx = device.txBytes !== null && typeof device.txBytes !== "undefined";
-  if (hasRx || hasTx) {
-    cell.textContent = `RX ${formatBytes(device.rxBytes || 0)} / TX ${formatBytes(device.txBytes || 0)}`;
+  const hasRxCounter = device.rxBytes !== null && typeof device.rxBytes !== "undefined";
+  const hasTxCounter = device.txBytes !== null && typeof device.txBytes !== "undefined";
+  const usage = device.deviceUsage;
+  if (usage && !usage.baselineOnly) {
+    cell.className = "device-usage-value";
+    cell.textContent = formatBytes(usage.usageBytes);
+    cell.title = `RX ${formatBytes(usage.rxUsageBytes)} / TX ${formatBytes(usage.txUsageBytes)} this month`;
+    return cell;
+  }
+  if (usage && usage.baselineOnly) {
+    cell.className = "device-usage-unavailable";
+    cell.textContent = "Baseline";
+    cell.title = "The first router counter sample establishes the usage baseline.";
+    return cell;
+  }
+  if (hasRxCounter || hasTxCounter) {
+    cell.className = "device-usage-unavailable";
+    cell.textContent = "Baseline";
     return cell;
   }
 
@@ -290,9 +313,9 @@ function renderDevices(summary) {
   if (summary.deviceError && devices.length === 0) {
     elements.deviceNote.textContent = summary.deviceError;
   } else if (summary.deviceUsageAvailable) {
-    elements.deviceNote.textContent = "The router returned per-device byte counters as well as negotiated Wi-Fi link rates.";
+    elements.deviceNote.textContent = "Per-device usage is calculated from router RX/TX byte-counter deltas beginning with the first baseline sample.";
   } else {
-    elements.deviceNote.textContent = "The router reports negotiated Wi-Fi link rates per device. Per-device byte counters are not exposed by this firmware response.";
+    elements.deviceNote.textContent = "This firmware reports device identity, uptime, link rates, and signal, but does not expose per-device byte counters. The WAN total remains available.";
   }
 
   devices.forEach((device) => {
@@ -456,6 +479,8 @@ function renderSummary(summary) {
   elements.lastSync.textContent = formatTimestamp(summary.lastSyncAt);
   elements.baselineTime.textContent = formatTimestamp(summary.baselineAt);
   elements.routerCaption.textContent = `${summary.router?.model || "Huawei router"} · ${summary.router?.address || "192.168.100.1"}`;
+  const pollIntervalSeconds = Number(summary.pollIntervalSeconds) || AUTOMATIC_REFRESH_INTERVAL_MS / 1_000;
+  elements.telemetryNote.textContent = `The local server samples cumulative router counters every ${pollIntervalSeconds} seconds, even when this page is closed. This is interval polling, not a second-by-second realtime stream.`;
 
   updatePlanModeState(planMode);
   elements.capGb.value = settings.capGb || 500;
@@ -498,7 +523,7 @@ async function loadUsage(syncRouter = true) {
     }
 
     renderSummary(payload);
-    setStatusMessage(payload.router?.connected ? "Router synced locally." : "Showing stored data.");
+    setStatusMessage(syncRouter ? "Router synced locally." : "Dashboard refreshed from local history.");
   } catch (error) {
     setStatusMessage(error instanceof Error ? error.message : "The router could not be reached.", true);
   } finally {
@@ -583,15 +608,15 @@ async function handleManualSync() {
 }
 
 /**
- * Keeps the dashboard current while the local server is running. The interval
- * is intentionally conservative so the router's embedded web UI is not polled
- * aggressively on a home connection.
+ * Refreshes the dashboard from the server-owned snapshot while the local page
+ * is open. The server performs the router poll itself, so closing this page does
+ * not stop history collection.
  *
  * @returns {Promise<void>} Resolves after the background sync attempt.
  */
 async function handleAutomaticSync() {
   if (!elements.syncButton.disabled) {
-    await loadUsage(true);
+    await loadUsage(false);
   }
 }
 
@@ -619,7 +644,7 @@ async function initializeDashboard() {
   elements.planModeInputs.forEach((input) => input.addEventListener("change", handlePlanModeChange));
   updatePlanModeState("unlimited");
   await loadUsage(true);
-  dashboardState.syncTimer = window.setInterval(handleAutomaticSync, 30_000);
+  dashboardState.syncTimer = window.setInterval(handleAutomaticSync, AUTOMATIC_REFRESH_INTERVAL_MS);
 }
 
 /**
