@@ -188,8 +188,39 @@
             <div class="source-pill">HG8145X7-10 · WAN PPP statistics</div>
           </article>
         </section>
+
+        <section class="panel devices-panel" aria-label="Connected device activity">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-eyebrow">Connected clients</p>
+              <h2>Device activity</h2>
+            </div>
+            <span class="device-count" id="device-count">--</span>
+          </div>
+          <p class="device-note" id="device-note">
+            The router reports negotiated Wi-Fi link rates per device. Per-device byte counters are shown only if this firmware exposes them.
+          </p>
+          <div class="device-table-wrap">
+            <table class="device-table">
+              <thead>
+                <tr>
+                  <th scope="col">Device</th>
+                  <th scope="col">Connection</th>
+                  <th scope="col">Duration</th>
+                  <th scope="col">RX link</th>
+                  <th scope="col">TX link</th>
+                  <th scope="col">Signal</th>
+                  <th scope="col">Usage</th>
+                </tr>
+              </thead>
+              <tbody id="device-rows"></tbody>
+            </table>
+            <div class="devices-empty" id="devices-empty">
+              No connected-device details returned yet.
+            </div>
+          </div>
+        </section>
       </main>
     </div>
   </body>
 </html>
-
