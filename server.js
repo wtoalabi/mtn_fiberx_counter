@@ -10,6 +10,12 @@ const { URL } = require("node:url");
 const ROOT_DIRECTORY = __dirname;
 const DATA_DIRECTORY = path.join(ROOT_DIRECTORY, "data");
 const DATA_FILE = path.join(DATA_DIRECTORY, "usage.json");
+const WAN_STATS_ENDPOINTS = [
+  "/html/bbsp/common/get_wan_list_ipwanstat.asp",
+  "/html/bbsp/common/get_wan_list_pppwanstat.asp",
+  "/html/bbsp/common/wanStatsinfo.asp",
+  "/html/AllUsers/html/bbsp/common/wanStatsinfo.asp",
+];
 const DEVICE_ENDPOINT_GROUPS = [
   {
     name: "LAN/WLAN device list",
@@ -692,20 +698,26 @@ async function queryRouterDevices() {
  */
 function parseWanStatsPayload(payload) {
   const records = [];
-  const matches = payload.matchAll(/new\s+WaninfoStats\s*\(([^)]*)\)/g);
+  const matches = payload.matchAll(/new\s+(WaninfoStats|WanEthStats)\s*\(([^)]*)\)/g);
 
   for (const match of matches) {
-    const values = parseQuotedArguments(match[1]);
+    const values = splitJavaScriptArguments(match[2]).map(decodeJavaScriptLiteral);
     if (values.length < 5) {
       continue;
     }
 
+    const isEthernetStatsShape = match[1] === "WanEthStats";
+    const rxBytes = isEthernetStatsShape ? values[1] : values[2];
+    const rxPackets = isEthernetStatsShape ? values[2] : values[4];
+    const txBytes = isEthernetStatsShape ? values[3] : values[1];
+    const txPackets = isEthernetStatsShape ? values[4] : values[3];
+
     records.push({
       domain: values[0],
-      txBytes: normalizeCounter(values[1]),
-      rxBytes: normalizeCounter(values[2]),
-      txPackets: normalizeCounter(values[3]),
-      rxPackets: normalizeCounter(values[4]),
+      txBytes: normalizeCounter(txBytes),
+      rxBytes: normalizeCounter(rxBytes),
+      txPackets: normalizeCounter(txPackets),
+      rxPackets: normalizeCounter(rxPackets),
     });
   }
 
@@ -903,22 +915,41 @@ async function loginToRouter() {
  * @returns {Promise<object|null>} Aggregated counters or null when unauthenticated.
  */
 async function queryRouterStats() {
-  const endpoints = [
-    "/html/bbsp/common/get_wan_list_ipwanstat.asp",
-    "/html/bbsp/common/get_wan_list_pppwanstat.asp",
-  ];
   const records = [];
+  const failures = [];
+  let loginRequired = false;
 
-  for (const endpoint of endpoints) {
-    const response = await requestRouter(endpoint);
-    if (response.statusCode >= 400 || isRouterLoginPage(response.body)) {
-      return null;
+  for (const endpoint of WAN_STATS_ENDPOINTS) {
+    let response;
+    try {
+      response = await requestRouter(endpoint, { timeoutMs: 5_000 });
+    } catch (error) {
+      failures.push(`${endpoint}: ${error.message}`);
+      continue;
     }
-    records.push(...parseWanStatsPayload(response.body));
+    if (response.statusCode >= 400 || isRouterLoginPage(response.body)) {
+      if (isRouterLoginPage(response.body)) {
+        loginRequired = true;
+        failures.push(`${endpoint}: login page returned`);
+      } else {
+        failures.push(`${endpoint}: HTTP ${response.statusCode}`);
+      }
+      continue;
+    }
+    const parsed = parseWanStatsPayload(response.body);
+    if (parsed.length === 0) {
+      failures.push(`${endpoint}: no WaninfoStats payload`);
+      continue;
+    }
+    records.push(...parsed);
   }
 
   if (records.length === 0) {
-    return null;
+    return {
+      stats: null,
+      loginRequired,
+      error: `The router returned no parseable WAN statistics. ${failures.join("; ")}`,
+    };
   }
 
   let txBytes = "0";
@@ -932,7 +963,7 @@ async function queryRouterStats() {
     rxPackets = addCounterStrings(rxPackets, record.rxPackets);
   });
 
-  return { records, txBytes, rxBytes, txPackets, rxPackets };
+  return { stats: { records, txBytes, rxBytes, txPackets, rxPackets }, loginRequired: false, error: null };
 }
 
 /**
@@ -946,16 +977,17 @@ async function getRouterStats() {
     await loginToRouter();
   }
 
-  let stats = await queryRouterStats();
-  if (!stats) {
+  let result = await queryRouterStats();
+  if (!result.stats && result.loginRequired) {
+    routerSession.loggedIn = false;
     await loginToRouter();
-    stats = await queryRouterStats();
+    result = await queryRouterStats();
   }
-  if (!stats) {
-    throw new Error("The router returned no WAN statistics.");
+  if (!result.stats) {
+    throw new Error(result.error || "The router returned no WAN statistics.");
   }
 
-  return stats;
+  return result.stats;
 }
 
 /**
