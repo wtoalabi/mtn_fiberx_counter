@@ -13,6 +13,8 @@ The local Node server logs into the router, reads RX/TX bytes, calculates the de
 
 The first sync establishes a baseline and records zero usage. Leave the server running so the 30-second polling interval can build the daily chart.
 
+The dashboard also checks the Huawei connected-client resources and displays the device name/host, IP or MAC address, SSID, connection duration, negotiated RX/TX Wi-Fi link rates, and signal strength when the firmware returns them. These are link rates, not current internet throughput. This HG8145X7-10 UI exposes per-station rates but does not expose a reliable per-station monthly byte history in the responses inspected, so the device table marks byte usage as unavailable when appropriate.
+
 ## Run it
 
 Use Node.js 18 or newer. No package installation is required.
@@ -29,10 +31,11 @@ node server.js
 
 The router uses a self-signed certificate, so `ROUTER_INSECURE_TLS=true` is enabled for the local router connection by default. The dashboard server binds to `127.0.0.1` only.
 
+If the dashboard reports that the router reset the connection, stop the server, wait for the Huawei login lockout timer to clear, verify that `ROUTER_PASSWORD` in `.env` matches the current router password, and start the server again. The collector pauses repeated login attempts after a failure so a wrong password does not continuously lock the router.
+
 ## Notes
 
 - This tracks the cumulative WAN PPP/IP counters, so it cannot reconstruct days from before the first baseline.
 - If the router reboots or resets its counters, the next sample is treated as a new interval instead of creating a negative number.
 - Plan settings and history are local to this checkout. Generated history is ignored by Git.
 - Use the dashboard's Export CSV button to export the selected month.
-
