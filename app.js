@@ -249,7 +249,7 @@ function renderChart(dailyUsage) {
 
   const chartRows = dailyUsage.slice(-14);
   const values = chartRows.map((row) => bytesToNumber(row.usageBytes) / 1_000_000_000);
-  const maxValue = Math.max(1, ...values);
+  const maxValue = Math.max(0.01, ...values);
   const axisSteps = [1, 0.75, 0.5, 0.25, 0];
   const axisDecimals = maxValue < 1 ? 2 : 0;
 
