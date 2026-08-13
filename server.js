@@ -36,6 +36,37 @@ const DEVICE_ENDPOINT_GROUPS = [
     ],
   },
 ];
+const COLLECTION_INTERVAL_MS = 30_000;
+const KNOWN_DEVICE_CONSTRUCTOR_DEFINITIONS = {
+  /**
+   * The associated-device endpoint omits this constructor's function
+   * declaration, so its stable Huawei field order is kept as a parser fallback.
+   */
+  stAssociatedDevice: [
+    "domain",
+    "AssociatedDeviceMACAddress",
+    "X_HW_Uptime",
+    "X_HW_RxRate",
+    "X_HW_TxRate",
+    "X_HW_RSSI",
+    "X_HW_Noise",
+    "X_HW_SNR",
+    "X_HW_SingalQuality",
+    "X_HW_WorkingMode",
+    "X_HW_WMMStatus",
+    "X_HW_PSMode",
+    "X_HW_HighBandFlag",
+    "AssociatedDeviceIPAddress",
+    "HW_AssociatedDevicedescriptions",
+    "X_HW_AntennaNum",
+    "X_HW_11kSupported",
+    "X_HW_11vSupported",
+    "X_HW_DualBandSupported",
+    "X_HW_BeamFormingSupported",
+    "X_HW_11RSupported",
+    "X_HW_IsMultilink",
+  ],
+};
 const routerSession = {
   cookies: new Map(),
   loggedIn: false,
@@ -44,6 +75,8 @@ const routerSession = {
 let cachedConfig = null;
 let collectionPromise = null;
 let persistenceQueue = Promise.resolve();
+let backgroundCollectionTimer = null;
+let lastBackgroundCollectionError = null;
 
 /**
  * Loads simple KEY=VALUE pairs from an optional local .env file without adding
@@ -86,7 +119,7 @@ function loadDotEnvFile(filePath) {
  * Reads and validates runtime configuration while deliberately excluding the
  * router password from any object that is logged or returned to the browser.
  *
- * @returns {{port:number,host:string,routerUrl:URL,routerUsername:string,routerPassword:string,allowInsecureTls:boolean,usageTimezone:string}} Runtime configuration.
+ * @returns {{port:number,host:string,routerUrl:URL,routerUsername:string,routerPassword:string,allowInsecureTls:boolean,usageTimezone:string,collectionIntervalMs:number}} Runtime configuration.
  */
 function getConfig() {
   if (cachedConfig) {
@@ -105,6 +138,7 @@ function getConfig() {
     routerPassword: process.env.ROUTER_PASSWORD || "",
     allowInsecureTls: process.env.ROUTER_INSECURE_TLS !== "false",
     usageTimezone: process.env.USAGE_TIMEZONE || "Africa/Lagos",
+    collectionIntervalMs: COLLECTION_INTERVAL_MS,
   };
 
   return cachedConfig;
@@ -117,7 +151,7 @@ function getConfig() {
  */
 function createEmptyStore() {
   return {
-    version: 1,
+    version: 2,
     settings: {
       planMode: "unlimited",
       capGb: 500,
@@ -127,6 +161,7 @@ function createEmptyStore() {
     lastCounters: null,
     lastRouter: null,
     lastDevices: null,
+    deviceUsageSamples: [],
     samples: [],
   };
 }
@@ -144,7 +179,7 @@ function normalizeStore(candidate) {
   const settings = source.settings && typeof source.settings === "object" ? source.settings : {};
 
   return {
-    version: 1,
+    version: 2,
     settings: {
       planMode: settings.planMode === "capped" ? "capped" : empty.settings.planMode,
       capGb: Number.isFinite(Number(settings.capGb)) && Number(settings.capGb) > 0 ? Number(settings.capGb) : empty.settings.capGb,
@@ -154,6 +189,7 @@ function normalizeStore(candidate) {
     lastCounters: source.lastCounters && typeof source.lastCounters === "object" ? source.lastCounters : null,
     lastRouter: source.lastRouter && typeof source.lastRouter === "object" ? source.lastRouter : null,
     lastDevices: source.lastDevices && typeof source.lastDevices === "object" ? source.lastDevices : null,
+    deviceUsageSamples: Array.isArray(source.deviceUsageSamples) ? source.deviceUsageSamples : [],
     samples: Array.isArray(source.samples) ? source.samples : [],
   };
 }
@@ -416,6 +452,29 @@ function parseOptionalNumber(value) {
 }
 
 /**
+ * Parses a device link rate into megabits per second while honoring explicit
+ * units and the kilobit-per-second convention used by stAssociatedDevice.
+ *
+ * @param {string} value A raw router rate field.
+ * @param {"Kbps"|"Mbps"} defaultUnit Unit to use when the router omits one.
+ * @returns {number|null} Rate in megabits per second, or null when unavailable.
+ */
+function parseOptionalRateMbps(value, defaultUnit = "Mbps") {
+  const rawValue = String(value || "").replace(/,/g, "").trim();
+  const parsed = parseOptionalNumber(rawValue);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  if (/k(?:bps|bit|b\/s)/i.test(rawValue)) {
+    return parsed / 1_000;
+  }
+  if (/m(?:bps|bit|b\/s)/i.test(rawValue)) {
+    return parsed;
+  }
+  return defaultUnit === "Kbps" ? parsed / 1_000 : parsed;
+}
+
+/**
  * Parses an optional cumulative byte field without turning an unavailable
  * marker such as -- into a misleading zero.
  *
@@ -439,7 +498,14 @@ function parseOptionalCounter(value) {
 function normalizeDeviceRecord(fields, source, constructorName = "") {
   const mac = readDeviceField(fields, ["macaddress", "hardwareaddress", "mac"]);
   const ip = readDeviceField(fields, ["ipaddress", "ipv4address", "ip"]);
-  const hostName = readDeviceField(fields, ["hostname", "devicename", "clientname", "friendlyname"]);
+  const hostName = readDeviceField(fields, [
+    "hostname",
+    "devicename",
+    "clientname",
+    "friendlyname",
+    "description",
+    "associateddevicedescription",
+  ]);
   const genericName = readDeviceField(fields, ["name"]);
   const name = hostName || genericName || "Unknown device";
   if (!mac && !ip && name === "Unknown device") {
@@ -450,6 +516,7 @@ function normalizeDeviceRecord(fields, source, constructorName = "") {
   const rxRate = readDeviceField(fields, ["receivingrate", "receiverrate", "rxrate", "receiverate", "downlinkrate"]);
   const rxBytes = parseOptionalCounter(readDeviceField(fields, ["bytesreceived", "rxbytes", "receivebytes"]));
   const txBytes = parseOptionalCounter(readDeviceField(fields, ["bytessent", "txbytes", "transmitbytes", "sendbytes"]));
+  const defaultRateUnit = constructorName === "stAssociatedDevice" ? "Kbps" : "Mbps";
   const normalizedMac = mac.replace(/-/g, ":").toUpperCase();
   const identity = normalizedMac || ip || `${name}:${readDeviceField(fields, ["ssidname", "ssid"])}`;
 
@@ -460,14 +527,14 @@ function normalizeDeviceRecord(fields, source, constructorName = "") {
     mac: normalizedMac || null,
     ip: ip || null,
     ssid: readDeviceField(fields, ["ssidname", "ssid"]) || null,
-    connectionType: readDeviceField(fields, ["connectiontype", "networktype", "interfacetype"]) || null,
-    durationSeconds: parseOptionalNumber(readDeviceField(fields, ["connectionduration", "duration", "onlineduration"])),
-    txRateMbps: parseOptionalNumber(txRate),
-    rxRateMbps: parseOptionalNumber(rxRate),
+    connectionType: readDeviceField(fields, ["connectiontype", "networktype", "interfacetype", "workingmode", "wirelessmode"]) || null,
+    durationSeconds: parseOptionalNumber(readDeviceField(fields, ["connectionduration", "duration", "onlineduration", "uptime"])),
+    txRateMbps: parseOptionalRateMbps(txRate, defaultRateUnit),
+    rxRateMbps: parseOptionalRateMbps(rxRate, defaultRateUnit),
     signalStrengthDbm: parseOptionalNumber(readDeviceField(fields, ["signalstrength", "rssi"])),
     noiseDbm: parseOptionalNumber(readDeviceField(fields, ["noise"])),
     snrDb: parseOptionalNumber(readDeviceField(fields, ["signaltonoiseratio", "snr"])),
-    signalQualityDbm: parseOptionalNumber(readDeviceField(fields, ["signalquality"])),
+    signalQualityDbm: parseOptionalNumber(readDeviceField(fields, ["signalquality", "singalquality", "quality"])),
     rxBytes,
     txBytes,
     source,
@@ -503,7 +570,7 @@ function parseRouterConstructorDevices(payload, source) {
   const records = [];
   const definitions = getRouterConstructorDefinitions(payload);
   for (const match of payload.matchAll(/new\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)/g)) {
-    const parameters = definitions.get(match[1]);
+    const parameters = definitions.get(match[1]) || KNOWN_DEVICE_CONSTRUCTOR_DEFINITIONS[match[1]];
     if (!parameters) {
       continue;
     }
