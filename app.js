@@ -54,6 +54,10 @@ function getDashboardElements() {
     txCounter: document.getElementById("tx-counter"),
     lastSync: document.getElementById("last-sync"),
     baselineTime: document.getElementById("baseline-time"),
+    deviceCount: document.getElementById("device-count"),
+    deviceNote: document.getElementById("device-note"),
+    deviceRows: document.getElementById("device-rows"),
+    devicesEmpty: document.getElementById("devices-empty"),
   };
 }
 
@@ -197,6 +201,132 @@ function formatDayLabel(dayKey) {
 }
 
 /**
+ * Formats a connected-device duration reported by the router in seconds.
+ *
+ * @param {number|null|undefined} seconds Connection duration in seconds.
+ * @returns {string} A compact duration label.
+ */
+function formatDeviceDuration(seconds) {
+  if (!Number.isFinite(Number(seconds))) {
+    return "--";
+  }
+
+  const totalSeconds = Math.max(0, Math.round(Number(seconds)));
+  const days = Math.floor(totalSeconds / 86_400);
+  const hours = Math.floor((totalSeconds % 86_400) / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  if (days > 0) {
+    return `${days}d ${hours}h`;
+  }
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  return `${minutes}m`;
+}
+
+/**
+ * Formats a negotiated station link rate without presenting it as actual
+ * internet throughput.
+ *
+ * @param {number|null|undefined} rateMbps Rate in megabits per second.
+ * @returns {string} A link-rate label.
+ */
+function formatDeviceRate(rateMbps) {
+  return Number.isFinite(Number(rateMbps)) ? `${Math.round(Number(rateMbps))} Mbps` : "--";
+}
+
+/**
+ * Formats the strongest signal field available from the connected-device row.
+ *
+ * @param {object} device A normalized connected-device record.
+ * @returns {string} A signal label.
+ */
+function formatDeviceSignal(device) {
+  if (Number.isFinite(Number(device.signalStrengthDbm))) {
+    return `${Math.round(Number(device.signalStrengthDbm))} dBm`;
+  }
+  if (Number.isFinite(Number(device.signalQualityDbm))) {
+    return `${Math.round(Number(device.signalQualityDbm))} dBm`;
+  }
+  return "--";
+}
+
+/**
+ * Creates the usage cell for a device. The Huawei station table generally
+ * exposes link rates but not per-client byte counters, so the unavailable
+ * state is explicit instead of implying that the WAN total belongs to one
+ * device.
+ *
+ * @param {object} device A normalized connected-device record.
+ * @returns {HTMLTableCellElement} A populated usage cell.
+ */
+function createDeviceUsageCell(device) {
+  const cell = document.createElement("td");
+  const hasRx = device.rxBytes !== null && typeof device.rxBytes !== "undefined";
+  const hasTx = device.txBytes !== null && typeof device.txBytes !== "undefined";
+  if (hasRx || hasTx) {
+    cell.textContent = `RX ${formatBytes(device.rxBytes || 0)} / TX ${formatBytes(device.txBytes || 0)}`;
+    return cell;
+  }
+
+  cell.className = "device-usage-unavailable";
+  cell.textContent = "Not exposed";
+  return cell;
+}
+
+/**
+ * Renders the current connected-device snapshot with identity, association,
+ * duration, negotiated rates, signal, and any firmware-provided byte fields.
+ *
+ * @param {object} summary The normalized collector summary.
+ * @returns {void}
+ */
+function renderDevices(summary) {
+  const devices = Array.isArray(summary.devices) ? summary.devices : [];
+  elements.deviceRows.replaceChildren();
+  elements.deviceCount.textContent = `${devices.length} connected`;
+  elements.devicesEmpty.hidden = devices.length > 0;
+
+  if (summary.deviceError && devices.length === 0) {
+    elements.deviceNote.textContent = summary.deviceError;
+  } else if (summary.deviceUsageAvailable) {
+    elements.deviceNote.textContent = "The router returned per-device byte counters as well as negotiated Wi-Fi link rates.";
+  } else {
+    elements.deviceNote.textContent = "The router reports negotiated Wi-Fi link rates per device. Per-device byte counters are not exposed by this firmware response.";
+  }
+
+  devices.forEach((device) => {
+    const row = document.createElement("tr");
+    const identityCell = document.createElement("td");
+    identityCell.className = "device-identity";
+    const name = document.createElement("span");
+    name.className = "device-name";
+    name.textContent = device.name || "Unknown device";
+    const address = document.createElement("span");
+    address.className = "device-address";
+    address.textContent = device.ip || device.mac || "No address reported";
+    identityCell.append(name, address);
+
+    const connectionCell = document.createElement("td");
+    connectionCell.textContent = device.ssid || device.connectionType || "Wi-Fi";
+    const durationCell = document.createElement("td");
+    durationCell.textContent = formatDeviceDuration(device.durationSeconds);
+    const rxCell = document.createElement("td");
+    rxCell.className = "device-link-rate";
+    rxCell.textContent = formatDeviceRate(device.rxRateMbps);
+    const txCell = document.createElement("td");
+    txCell.className = "device-link-rate";
+    txCell.textContent = formatDeviceRate(device.txRateMbps);
+    const signalCell = document.createElement("td");
+    signalCell.className = "device-signal";
+    signalCell.textContent = formatDeviceSignal(device);
+
+    row.append(identityCell, connectionCell, durationCell, rxCell, txCell, signalCell, createDeviceUsageCell(device));
+    elements.deviceRows.appendChild(row);
+  });
+}
+
+/**
  * Updates the one-line status region without exposing server internals or
  * router credentials to the page.
  *
@@ -331,6 +461,7 @@ function renderSummary(summary) {
   elements.capGb.value = settings.capGb || 500;
   elements.billingDay.value = settings.billingStartDay || 1;
   renderChart(summary.daily || []);
+  renderDevices(summary);
 
   if (summary.router && summary.router.connected === false) {
     elements.syncDot.classList.add("is-error");
