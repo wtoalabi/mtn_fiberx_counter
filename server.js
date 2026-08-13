@@ -559,8 +559,9 @@ function getRouterConstructorDefinitions(payload) {
 }
 
 /**
- * Parses `new SomeHuaweiDevice(...)` calls using the parameter names discovered
- * in the same response.
+ * Parses nested `new SomeHuaweiDevice(...)` calls using the parameter names
+ * discovered in the same response. Huawei wraps these records in `new Array`,
+ * so the wrapper is skipped to let the station constructor match directly.
  *
  * @param {string} payload Raw router response text.
  * @param {string} source Router endpoint that produced the payload.
@@ -569,7 +570,7 @@ function getRouterConstructorDefinitions(payload) {
 function parseRouterConstructorDevices(payload, source) {
   const records = [];
   const definitions = getRouterConstructorDefinitions(payload);
-  for (const match of payload.matchAll(/new\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)/g)) {
+  for (const match of payload.matchAll(/new\s+(?!Array\b)([A-Za-z_$][\w$]*)\s*\(([^)]*)\)/g)) {
     const parameters = definitions.get(match[1]) || KNOWN_DEVICE_CONSTRUCTOR_DEFINITIONS[match[1]];
     if (!parameters) {
       continue;
