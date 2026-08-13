@@ -35,18 +35,24 @@ The server-owned 30-second collector is not realtime streaming. It reads cumulat
 
 ## Run in the background on macOS
 
-Closing the browser does not stop collection as long as `node server.js` remains running. A full laptop shutdown does stop live sampling. When the laptop returns, the collector subtracts the last persisted router counter from the latest counter and records the difference as an offline-gap reconciliation. The exact time distribution is unknown, so the amount is assigned to the return sample. The included `com.mtn.fiberx.tracker.plist` starts the server at login and restarts it if it exits, so collection resumes after the laptop starts again.
+Closing the browser does not stop collection as long as `node server.js` remains running. A full laptop shutdown does stop live sampling. When the laptop returns, the collector subtracts the last persisted router counter from the latest counter and records the difference as an offline-gap reconciliation. The exact time distribution is unknown, so the amount is assigned to the return sample. The generated LaunchAgent starts the server at login and restarts it if it exits, so collection resumes after the laptop starts again.
 
-Stop any foreground FiberX server first so only one process owns the configured port, then install the LaunchAgent:
+Use the included one-command launcher. It discovers the Node.js path, generates the LaunchAgent for this checkout, installs it, starts `server.js` through launchd, and verifies the local dashboard:
 
 ```sh
-mkdir -p "$HOME/Library/LaunchAgents"
-cp /Users/mac/dev/web/fiberx/com.mtn.fiberx.tracker.plist "$HOME/Library/LaunchAgents/"
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.mtn.fiberx.tracker.plist"
-launchctl kickstart -k "gui/$(id -u)/com.mtn.fiberx.tracker"
+/Users/mac/dev/web/fiberx/start-fiberx.sh
 ```
 
-The plist is configured for this checkout and the Homebrew Node path shown by `command -v node` on this Mac. If the project or Node installation moves, update those two absolute paths before loading it. Logs go to `/tmp/fiberx-server.log` and `/tmp/fiberx-server-error.log`.
+If macOS says the script is not executable, run this once and then run the launcher:
+
+```sh
+chmod +x /Users/mac/dev/web/fiberx/start-fiberx.sh
+/Users/mac/dev/web/fiberx/start-fiberx.sh
+```
+
+The generated plist is stored at `~/Library/LaunchAgents/com.mtn.fiberx.tracker.plist`. The script is safe to run again after moving Node or changing the project path; it refreshes the plist and restarts the same service. Logs go to `~/Library/Logs/FiberX/server.log` and `~/Library/Logs/FiberX/server-error.log`.
+
+Do not leave a manually started `node server.js` running when you run the launcher. If port 4000 (or the `PORT` value in `.env`) is already occupied, the script stops and tells you which process must be stopped; it never kills an existing process automatically.
 
 If the dashboard reports that the router reset the connection, stop the server, wait for the Huawei login lockout timer to clear, verify that `ROUTER_PASSWORD` in `.env` matches the current router password, and start the server again. The collector pauses repeated login attempts after a failure so a wrong password does not continuously lock the router.
 
