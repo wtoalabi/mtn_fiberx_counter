@@ -151,7 +151,7 @@ function getConfig() {
  */
 function createEmptyStore() {
   return {
-    version: 2,
+    version: 3,
     settings: {
       planMode: "unlimited",
       capGb: 500,
@@ -161,6 +161,7 @@ function createEmptyStore() {
     lastCounters: null,
     lastRouter: null,
     lastDevices: null,
+    lastOfflineGap: null,
     deviceUsageSamples: [],
     samples: [],
   };
@@ -179,7 +180,7 @@ function normalizeStore(candidate) {
   const settings = source.settings && typeof source.settings === "object" ? source.settings : {};
 
   return {
-    version: 2,
+    version: 3,
     settings: {
       planMode: settings.planMode === "capped" ? "capped" : empty.settings.planMode,
       capGb: Number.isFinite(Number(settings.capGb)) && Number(settings.capGb) > 0 ? Number(settings.capGb) : empty.settings.capGb,
@@ -189,6 +190,7 @@ function normalizeStore(candidate) {
     lastCounters: source.lastCounters && typeof source.lastCounters === "object" ? source.lastCounters : null,
     lastRouter: source.lastRouter && typeof source.lastRouter === "object" ? source.lastRouter : null,
     lastDevices: source.lastDevices && typeof source.lastDevices === "object" ? source.lastDevices : null,
+    lastOfflineGap: source.lastOfflineGap && typeof source.lastOfflineGap === "object" ? source.lastOfflineGap : null,
     deviceUsageSamples: Array.isArray(source.deviceUsageSamples) ? source.deviceUsageSamples : [],
     samples: Array.isArray(source.samples) ? source.samples : [],
   };
@@ -274,6 +276,35 @@ function calculateCounterDelta(current, previous) {
   }
 
   return { delta: (currentValue - previousValue).toString(), reset: false };
+}
+
+/**
+ * Detects a collection gap long enough to represent a stopped or sleeping
+ * laptop. Normal polling jitter stays below the threshold; a later sample can
+ * then be labeled as the usage accumulated while the collector was away.
+ *
+ * @param {object|null|undefined} previousCounters The last persisted counters.
+ * @param {Date} capturedAt Timestamp of the current router sample.
+ * @returns {{startedAt:string,endedAt:string,durationSeconds:number}|null} Gap metadata or null.
+ */
+function detectOfflineGap(previousCounters, capturedAt) {
+  if (!previousCounters?.capturedAt) {
+    return null;
+  }
+
+  const previousTimestamp = Date.parse(previousCounters.capturedAt);
+  const currentTimestamp = capturedAt.getTime();
+  const elapsedMilliseconds = currentTimestamp - previousTimestamp;
+  const minimumGapMilliseconds = getConfig().collectionIntervalMs * 1.5;
+  if (!Number.isFinite(previousTimestamp) || elapsedMilliseconds <= minimumGapMilliseconds) {
+    return null;
+  }
+
+  return {
+    startedAt: new Date(previousTimestamp).toISOString(),
+    endedAt: capturedAt.toISOString(),
+    durationSeconds: Math.round(elapsedMilliseconds / 1_000),
+  };
 }
 
 /**
@@ -1280,6 +1311,7 @@ function buildSummary(store, monthKey) {
     txBytes: store.lastCounters?.txBytes || "0",
     lastSyncAt: store.lastRouter?.capturedAt || null,
     baselineAt: store.baseline?.capturedAt || null,
+    lastOfflineGap: store.lastOfflineGap || null,
     settings: store.settings,
     devices: (store.lastDevices?.devices || []).map((device) => ({
       ...device,
@@ -1338,6 +1370,16 @@ async function collectSnapshotInternal() {
   const previous = store.lastCounters;
   const rxDelta = calculateCounterDelta(stats.rxBytes, previous?.rxBytes || "0");
   const txDelta = calculateCounterDelta(stats.txBytes, previous?.txBytes || "0");
+  const usageBytes = previous ? addCounterStrings(rxDelta.delta, txDelta.delta) : "0";
+  const counterReset = Boolean(previous && (rxDelta.reset || txDelta.reset));
+  const detectedGap = detectOfflineGap(previous, capturedAt);
+  const offlineGap = detectedGap
+    ? {
+      ...detectedGap,
+      usageBytes: previous && !counterReset ? usageBytes : null,
+      counterReset,
+    }
+    : null;
   const sample = {
     capturedAt: capturedAt.toISOString(),
     day,
@@ -1346,8 +1388,9 @@ async function collectSnapshotInternal() {
     txBytes: stats.txBytes,
     rxDeltaBytes: previous ? rxDelta.delta : "0",
     txDeltaBytes: previous ? txDelta.delta : "0",
-    usageBytes: previous ? addCounterStrings(rxDelta.delta, txDelta.delta) : "0",
-    counterReset: Boolean(previous && (rxDelta.reset || txDelta.reset)),
+    usageBytes,
+    counterReset,
+    offlineGap,
     sampleCount: stats.records.length,
   };
 
@@ -1363,6 +1406,7 @@ async function collectSnapshotInternal() {
     };
   }
   store.lastCounters = { capturedAt: capturedAt.toISOString(), rxBytes: stats.rxBytes, txBytes: stats.txBytes };
+  store.lastOfflineGap = offlineGap || store.lastOfflineGap;
   store.lastRouter = {
     connected: true,
     capturedAt: capturedAt.toISOString(),

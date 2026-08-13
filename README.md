@@ -35,7 +35,7 @@ The server-owned 30-second collector is not realtime streaming. It reads cumulat
 
 ## Run in the background on macOS
 
-Closing the browser does not stop collection as long as `node server.js` remains running. A full laptop shutdown does stop the process and creates a gap that no collector can reconstruct. The included `com.mtn.fiberx.tracker.plist` starts the server at login and restarts it if it exits, so collection resumes after the laptop starts again.
+Closing the browser does not stop collection as long as `node server.js` remains running. A full laptop shutdown does stop live sampling. When the laptop returns, the collector subtracts the last persisted router counter from the latest counter and records the difference as an offline-gap reconciliation. The exact time distribution is unknown, so the amount is assigned to the return sample. The included `com.mtn.fiberx.tracker.plist` starts the server at login and restarts it if it exits, so collection resumes after the laptop starts again.
 
 Stop any foreground FiberX server first so only one process owns the configured port, then install the LaunchAgent:
 
@@ -54,6 +54,7 @@ If the dashboard reports that the router reset the connection, stop the server, 
 
 - This tracks the cumulative WAN PPP/IP counters, so it cannot reconstruct days from before the first baseline.
 - If the router reboots or resets its counters, the next sample is treated as a new interval instead of creating a negative number.
-- A shutdown, sleep period, router outage, or stopped server leaves a history gap; the next successful sample resumes from the new counter value.
+- A shutdown, sleep period, router outage, or stopped server creates an offline interval. If the router counters continue increasing, the next successful sample reconciles the difference and labels it in the dashboard as usage while away.
+- If the router reboots or resets its counters during that interval, the tracker flags the gap and cannot reliably reconstruct the missing usage.
 - Plan settings and history are local to this checkout. Generated history is ignored by Git.
 - Use the dashboard's Export CSV button to export the selected month.

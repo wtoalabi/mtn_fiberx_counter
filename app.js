@@ -57,6 +57,7 @@ function getDashboardElements() {
     lastSync: document.getElementById("last-sync"),
     baselineTime: document.getElementById("baseline-time"),
     telemetryNote: document.getElementById("telemetry-note"),
+    offlineGapNote: document.getElementById("offline-gap-note"),
     deviceCount: document.getElementById("device-count"),
     deviceNote: document.getElementById("device-note"),
     deviceRows: document.getElementById("device-rows"),
@@ -481,6 +482,17 @@ function renderSummary(summary) {
   elements.routerCaption.textContent = `${summary.router?.model || "Huawei router"} · ${summary.router?.address || "192.168.100.1"}`;
   const pollIntervalSeconds = Number(summary.pollIntervalSeconds) || AUTOMATIC_REFRESH_INTERVAL_MS / 1_000;
   elements.telemetryNote.textContent = `The local server samples cumulative router counters every ${pollIntervalSeconds} seconds, even when this page is closed. This is interval polling, not a second-by-second realtime stream.`;
+  const offlineGap = summary.lastOfflineGap;
+  if (offlineGap && offlineGap.usageBytes !== null && typeof offlineGap.usageBytes !== "undefined") {
+    elements.offlineGapNote.hidden = false;
+    elements.offlineGapNote.textContent = `Last offline gap reconciled: ${formatBytes(offlineGap.usageBytes)} between ${formatTimestamp(offlineGap.startedAt)} and ${formatTimestamp(offlineGap.endedAt)}.`;
+  } else if (offlineGap) {
+    elements.offlineGapNote.hidden = false;
+    elements.offlineGapNote.textContent = "Last offline gap detected, but the router reset its counters; usage during that gap cannot be reconstructed reliably.";
+  } else {
+    elements.offlineGapNote.hidden = true;
+    elements.offlineGapNote.textContent = "";
+  }
 
   updatePlanModeState(planMode);
   elements.capGb.value = settings.capGb || 500;

@@ -640,6 +640,13 @@ h2 {
   border-top: 1px solid #25252a;
 }
 
+.telemetry-gap-note {
+  margin: 12px 0 0;
+  color: var(--yellow-soft);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
 .how-it-works-panel h2 {
   margin-bottom: 13px;
 }
