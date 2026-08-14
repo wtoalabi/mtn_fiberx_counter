@@ -1,10 +1,12 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const dns = require("node:dns");
 const fs = require("node:fs");
 const fsPromises = fs.promises;
 const http = require("node:http");
 const https = require("node:https");
+const net = require("node:net");
 const path = require("node:path");
 const { URL } = require("node:url");
 let DatabaseSync = null;
@@ -34,6 +36,25 @@ const ALLOWED_DOT_ENV_KEYS = new Set([
 ]);
 const STORE_VERSION = 4;
 const DATABASE_SCHEMA_VERSION = 1;
+const MAX_COUNTER_DIGITS = 128;
+const MAX_DEVICE_FIELD_LENGTH = 512;
+const MAX_DEVICE_RECORDS = 512;
+const MAX_JSON_NODES = 10_000;
+const MAX_ROUTER_BODY_BYTES = 2 * 1_024 * 1_024;
+const MAX_ROUTER_COOKIES = 64;
+const MAX_ROUTER_COOKIE_BYTES = 8_192;
+const MAX_WAN_RECORDS = 128;
+const PRIVATE_NETWORKS = new net.BlockList();
+
+PRIVATE_NETWORKS.addSubnet("10.0.0.0", 8, "ipv4");
+PRIVATE_NETWORKS.addSubnet("100.64.0.0", 10, "ipv4");
+PRIVATE_NETWORKS.addSubnet("127.0.0.0", 8, "ipv4");
+PRIVATE_NETWORKS.addSubnet("169.254.0.0", 16, "ipv4");
+PRIVATE_NETWORKS.addSubnet("172.16.0.0", 12, "ipv4");
+PRIVATE_NETWORKS.addSubnet("192.168.0.0", 16, "ipv4");
+PRIVATE_NETWORKS.addAddress("::1", "ipv6");
+PRIVATE_NETWORKS.addSubnet("fc00::", 7, "ipv6");
+PRIVATE_NETWORKS.addSubnet("fe80::", 10, "ipv6");
 const WAN_STATS_ENDPOINTS = [
   "/html/bbsp/common/get_wan_list_ipwanstat.asp",
   "/html/bbsp/common/get_wan_list_pppwanstat.asp",
@@ -250,8 +271,74 @@ function parseRouterUrl(rawValue) {
     throw new Error("ROUTER_URL must contain only the router origin, without a path, query, or fragment.");
   }
 
+  const hostname = routerUrl.hostname.replace(/^\[|\]$/g, "");
+  const addressFamily = net.isIP(hostname);
+  if (addressFamily && !isPrivateRouterAddress(hostname, addressFamily)) {
+    throw new Error("ROUTER_URL must resolve to a private, loopback, or link-local address.");
+  }
+
   routerUrl.pathname = "/";
   return routerUrl;
+}
+
+/**
+ * Determines whether one resolved IP belongs to a network range appropriate
+ * for a local router. Public, unspecified, multicast, and IPv4-mapped IPv6
+ * addresses are rejected to prevent credential exfiltration through SSRF.
+ *
+ * @param {string} address Resolved IPv4 or IPv6 address.
+ * @param {number|string} family Address family reported by Node.js.
+ * @returns {boolean} Whether the address is an allowed local-network target.
+ */
+function isPrivateRouterAddress(address, family) {
+  const normalizedAddress = String(address || "").replace(/^\[|\]$/g, "").split("%")[0];
+  const normalizedFamily = family === 6 || family === "IPv6" ? "ipv6" : "ipv4";
+  if (normalizedAddress.toLowerCase().startsWith("::ffff:")) {
+    return false;
+  }
+
+  return PRIVATE_NETWORKS.check(normalizedAddress, normalizedFamily);
+}
+
+/**
+ * Resolves a router hostname and returns only private-network results to the
+ * HTTP client. Supplying the selected address through Node's lookup callback
+ * closes the DNS rebinding window between validation and socket connection.
+ *
+ * @param {string} hostname Router hostname requested by the HTTP client.
+ * @param {object|number} options Node.js DNS lookup options.
+ * @param {Function} callback Node.js lookup completion callback.
+ * @returns {void}
+ */
+function lookupPrivateRouterAddress(hostname, options, callback) {
+  const lookupOptions = typeof options === "number" ? { family: options } : { ...(options || {}) };
+  const requestedFamily = lookupOptions.family === 6 || lookupOptions.family === "IPv6"
+    ? 6
+    : lookupOptions.family === 4 || lookupOptions.family === "IPv4" ? 4 : 0;
+
+  dns.lookup(hostname.replace(/^\[|\]$/g, ""), { all: true, verbatim: true }, (error, addresses) => {
+    if (error) {
+      callback(error);
+      return;
+    }
+
+    const permitted = addresses.filter((entry) => (
+      (!requestedFamily || entry.family === requestedFamily)
+      && isPrivateRouterAddress(entry.address, entry.family)
+    ));
+    if (permitted.length === 0) {
+      const lookupError = new Error("ROUTER_URL did not resolve to an allowed private-network address.");
+      lookupError.code = "ERR_FIBERX_PUBLIC_ROUTER_TARGET";
+      callback(lookupError);
+      return;
+    }
+
+    if (lookupOptions.all) {
+      callback(null, permitted);
+      return;
+    }
+    callback(null, permitted[0].address, permitted[0].family);
+  });
 }
 
 /**
@@ -848,7 +935,9 @@ function addCounterStrings(first, second) {
  */
 function normalizeCounter(value) {
   const normalized = String(value ?? "").trim();
-  return /^\d+$/.test(normalized) ? normalized : "0";
+  return normalized.length >= 1 && normalized.length <= MAX_COUNTER_DIGITS && /^\d+$/.test(normalized)
+    ? normalized
+    : "0";
 }
 
 /**
@@ -1031,7 +1120,7 @@ function decodeJavaScriptLiteral(literal) {
  * @returns {string} Lowercase alphanumeric field name.
  */
 function normalizeDeviceFieldName(fieldName) {
-  return String(fieldName || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+  return String(fieldName || "").slice(0, MAX_DEVICE_FIELD_LENGTH).replace(/[^a-z0-9]/gi, "").toLowerCase();
 }
 
 /**
@@ -1045,7 +1134,7 @@ function normalizeDeviceFieldName(fieldName) {
 function readDeviceField(fields, aliases) {
   const entries = Object.entries(fields).map(([key, value]) => ({
     key: normalizeDeviceFieldName(key),
-    value: String(value || "").trim(),
+    value: String(value || "").trim().slice(0, MAX_DEVICE_FIELD_LENGTH),
   }));
 
   for (const alias of aliases) {
@@ -1194,6 +1283,9 @@ function parseRouterConstructorDevices(payload, source) {
   const records = [];
   const definitions = getRouterConstructorDefinitions(payload);
   for (const match of payload.matchAll(/new\s+(?!Array\b)([A-Za-z_$][\w$]*)\s*\(([^)]*)\)/g)) {
+    if (records.length >= MAX_DEVICE_RECORDS) {
+      break;
+    }
     const parameters = definitions.get(match[1]) || KNOWN_DEVICE_CONSTRUCTOR_DEFINITIONS[match[1]];
     if (!parameters) {
       continue;
@@ -1234,6 +1326,9 @@ function parseRouterHtmlDevices(payload, source) {
   const records = [];
   let headers = null;
   for (const rowMatch of payload.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)) {
+    if (records.length >= MAX_DEVICE_RECORDS) {
+      break;
+    }
     const cells = Array.from(rowMatch[1].matchAll(/<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi)).map((cell) => stripRouterMarkup(cell[1]));
     if (cells.length < 2) {
       continue;
@@ -1259,8 +1354,9 @@ function parseRouterHtmlDevices(payload, source) {
 }
 
 /**
- * Recursively extracts device-shaped objects from JSON responses used by some
- * Huawei firmware builds.
+ * Iteratively extracts device-shaped objects from JSON responses used by some
+ * Huawei firmware builds. Explicit node and record budgets avoid stack
+ * exhaustion and excessive memory use on malformed router responses.
  *
  * @param {unknown} value Parsed JSON value.
  * @param {object[]} records Accumulator for normalized records.
@@ -1268,19 +1364,27 @@ function parseRouterHtmlDevices(payload, source) {
  * @returns {void}
  */
 function collectJsonDeviceObjects(value, records, source) {
-  if (Array.isArray(value)) {
-    value.forEach((item) => collectJsonDeviceObjects(item, records, source));
-    return;
-  }
-  if (!value || typeof value !== "object") {
-    return;
-  }
+  const pending = [value];
+  let inspectedNodes = 0;
 
-  const record = normalizeDeviceRecord(value, source, "json");
-  if (record) {
-    records.push(record);
+  while (pending.length > 0 && inspectedNodes < MAX_JSON_NODES && records.length < MAX_DEVICE_RECORDS) {
+    const current = pending.pop();
+    inspectedNodes += 1;
+    const remainingCapacity = Math.max(0, MAX_JSON_NODES - inspectedNodes - pending.length);
+    if (Array.isArray(current)) {
+      pending.push(...current.slice(0, remainingCapacity));
+      continue;
+    }
+    if (!current || typeof current !== "object") {
+      continue;
+    }
+
+    const record = normalizeDeviceRecord(current, source, "json");
+    if (record) {
+      records.push(record);
+    }
+    pending.push(...Object.values(current).slice(0, remainingCapacity));
   }
-  Object.values(value).forEach((child) => collectJsonDeviceObjects(child, records, source));
 }
 
 /**
@@ -1304,7 +1408,7 @@ function parseDevicePayload(payload, source) {
   }
   records.push(...parseRouterConstructorDevices(payload, source));
   records.push(...parseRouterHtmlDevices(payload, source));
-  return mergeDeviceRecords(records);
+  return mergeDeviceRecords(records).slice(0, MAX_DEVICE_RECORDS);
 }
 
 /**
@@ -1507,6 +1611,9 @@ function parseWanStatsPayload(payload) {
   const matches = payload.matchAll(/new\s+(WaninfoStats|WanEthStats)\s*\(([^)]*)\)/g);
 
   for (const match of matches) {
+    if (records.length >= MAX_WAN_RECORDS) {
+      break;
+    }
     const values = splitJavaScriptArguments(match[2]).map(decodeJavaScriptLiteral);
     if (values.length < 5) {
       continue;
@@ -1539,6 +1646,10 @@ function parseWanStatsPayload(payload) {
  */
 function mergeRouterCookies(setCookieHeader) {
   const values = Array.isArray(setCookieHeader) ? setCookieHeader : setCookieHeader ? [setCookieHeader] : [];
+  if (values.length > MAX_ROUTER_COOKIES) {
+    throw new Error("The router returned too many session cookies.");
+  }
+
   values.forEach((value) => {
     const firstPart = value.split(";", 1)[0];
     const separator = firstPart.indexOf("=");
@@ -1548,12 +1659,22 @@ function mergeRouterCookies(setCookieHeader) {
 
     const name = firstPart.slice(0, separator).trim();
     const cookieValue = firstPart.slice(separator + 1).trim();
+    if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name)
+      || name.length > 128
+      || cookieValue.length > 4_096
+      || /[\x00-\x20\x7f;,]/.test(cookieValue)) {
+      throw new Error("The router returned an invalid session cookie.");
+    }
     if (cookieValue) {
       routerSession.cookies.set(name, cookieValue);
     } else {
       routerSession.cookies.delete(name);
     }
   });
+  if (routerSession.cookies.size > MAX_ROUTER_COOKIES || Buffer.byteLength(getRouterCookieHeader()) > MAX_ROUTER_COOKIE_BYTES) {
+    routerSession.cookies.clear();
+    throw new Error("The router session cookie limit was exceeded.");
+  }
 }
 
 /**
@@ -1579,6 +1700,19 @@ function requestRouter(pathname, options = {}) {
   const target = new URL(pathname, config.routerUrl);
   const body = options.body || "";
   const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 10_000;
+  const method = String(options.method || "GET").toUpperCase();
+  if (target.origin !== config.routerUrl.origin) {
+    throw new Error("Router requests must remain on the configured router origin.");
+  }
+  if (method !== "GET" && method !== "POST") {
+    throw new Error("Router requests may use only GET or POST.");
+  }
+  if (Buffer.byteLength(body) > 16_384) {
+    throw new Error("Router request body is too large.");
+  }
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 30_000) {
+    throw new Error("Router request timeout is outside the allowed range.");
+  }
   const headers = {
     Accept: "*/*",
     Connection: "close",
@@ -1590,7 +1724,7 @@ function requestRouter(pathname, options = {}) {
   if (cookieHeader) {
     headers.Cookie = cookieHeader;
   }
-  if (options.method && options.method !== "GET" && !headers["Content-Length"]) {
+  if (method !== "GET" && !headers["Content-Length"]) {
     headers["Content-Length"] = Buffer.byteLength(body);
   }
 
@@ -1599,10 +1733,11 @@ function requestRouter(pathname, options = {}) {
     protocol: target.protocol,
     hostname: target.hostname,
     port: target.port || (target.protocol === "https:" ? 443 : 80),
-    method: options.method || "GET",
+    method,
     path: `${target.pathname}${target.search}`,
     headers,
     agent: false,
+    lookup: lookupPrivateRouterAddress,
   };
   if (target.protocol === "https:") {
     requestOptions.rejectUnauthorized = !config.allowInsecureTls;
@@ -1610,14 +1745,34 @@ function requestRouter(pathname, options = {}) {
 
   return new Promise((resolve, reject) => {
     const request = transport.request(requestOptions, (response) => {
-      mergeRouterCookies(response.headers["set-cookie"]);
+      try {
+        mergeRouterCookies(response.headers["set-cookie"]);
+      } catch (error) {
+        response.destroy();
+        reject(error);
+        return;
+      }
+
       const chunks = [];
-      response.on("data", (chunk) => chunks.push(chunk));
+      let responseBytes = 0;
+      const declaredLength = Number(response.headers["content-length"]);
+      if (Number.isFinite(declaredLength) && declaredLength > MAX_ROUTER_BODY_BYTES) {
+        response.destroy(new Error("Router response exceeded the 2 MiB safety limit."));
+      }
+      response.on("data", (chunk) => {
+        responseBytes += chunk.length;
+        if (responseBytes > MAX_ROUTER_BODY_BYTES) {
+          response.destroy(new Error("Router response exceeded the 2 MiB safety limit."));
+          return;
+        }
+        chunks.push(chunk);
+      });
       response.on("end", () => resolve({
         statusCode: response.statusCode || 0,
         headers: response.headers,
         body: Buffer.concat(chunks).toString("utf8"),
       }));
+      response.on("error", (error) => reject(formatRouterRequestError(pathname, error)));
     });
 
     request.setTimeout(timeoutMs, () => request.destroy(new Error("Router request timed out.")));
@@ -1706,7 +1861,9 @@ async function loginToRouter() {
 
     const tokenResponse = await requestRouter("/asp/GetRandCount.asp", { method: "POST" });
     const token = tokenResponse.body.trim();
-    if (tokenResponse.statusCode >= 400 || isRouterLoginPage(tokenResponse.body) || !token) {
+    if (tokenResponse.statusCode >= 400
+      || isRouterLoginPage(tokenResponse.body)
+      || !/^[A-Za-z0-9._~-]{1,256}$/.test(token)) {
       throw new Error("The router did not provide a login token. Wait for the router lockout to clear and try again.");
     }
 
