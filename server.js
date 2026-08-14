@@ -1,5 +1,6 @@
 "use strict";
 
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const fsPromises = fs.promises;
 const http = require("node:http");
@@ -7,6 +8,10 @@ const https = require("node:https");
 const path = require("node:path");
 const { URL } = require("node:url");
 let DatabaseSync = null;
+
+if (process.platform !== "win32") {
+  process.umask(0o077);
+}
 
 try {
   ({ DatabaseSync } = require("node:sqlite"));
@@ -16,8 +21,17 @@ try {
 
 const ROOT_DIRECTORY = __dirname;
 const DATA_DIRECTORY = path.join(ROOT_DIRECTORY, "data");
+const ENVIRONMENT_FILE = path.join(ROOT_DIRECTORY, ".env");
 const DATABASE_FILE = path.join(DATA_DIRECTORY, "fiberx.sqlite");
 const JSON_DATA_FILE = path.join(DATA_DIRECTORY, "usage.json");
+const ALLOWED_DOT_ENV_KEYS = new Set([
+  "PORT",
+  "ROUTER_INSECURE_TLS",
+  "ROUTER_PASSWORD",
+  "ROUTER_URL",
+  "ROUTER_USERNAME",
+  "USAGE_TIMEZONE",
+]);
 const STORE_VERSION = 4;
 const DATABASE_SCHEMA_VERSION = 1;
 const WAN_STATS_ENDPOINTS = [
@@ -91,6 +105,68 @@ let backgroundCollectionTimer = null;
 let lastBackgroundCollectionError = null;
 
 /**
+ * Creates a distinguishable error for a local path that could redirect
+ * credential or telemetry access through a symbolic link. Storage fallback
+ * must not swallow these errors because doing so would weaken the path check.
+ *
+ * @param {string} message Actionable description of the unsafe path.
+ * @returns {Error & {code:string}} A security-specific local path error.
+ */
+function createUnsafePathError(message) {
+  const error = new Error(message);
+  error.code = "ERR_FIBERX_UNSAFE_PATH";
+  return error;
+}
+
+/**
+ * Verifies that an existing sensitive path has the expected type, refuses
+ * symbolic links, and removes group/other access on POSIX systems. The app's
+ * router credentials and device history are private to the current OS user.
+ *
+ * @param {string} filePath Absolute path to inspect.
+ * @param {"file"|"directory"} expectedType Required filesystem object type.
+ * @returns {void}
+ */
+function hardenPrivatePath(filePath, expectedType) {
+  if (!fs.existsSync(filePath)) {
+    return;
+  }
+
+  const stats = fs.lstatSync(filePath);
+  if (stats.isSymbolicLink()) {
+    throw createUnsafePathError(`Refusing to use symbolic link at ${filePath}.`);
+  }
+  if (expectedType === "directory" && !stats.isDirectory()) {
+    throw createUnsafePathError(`Expected a private directory at ${filePath}.`);
+  }
+  if (expectedType === "file" && !stats.isFile()) {
+    throw createUnsafePathError(`Expected a private regular file at ${filePath}.`);
+  }
+
+  if (process.platform !== "win32") {
+    fs.chmodSync(filePath, expectedType === "directory" ? 0o700 : 0o600);
+  }
+}
+
+/**
+ * Creates and secures the local data directory before either persistence
+ * backend opens a file. Existing database sidecars are tightened as well so an
+ * upgrade repairs permissions inherited from an older, permissive umask.
+ *
+ * @returns {void}
+ */
+function preparePrivateStorage() {
+  if (fs.existsSync(DATA_DIRECTORY)) {
+    hardenPrivatePath(DATA_DIRECTORY, "directory");
+  } else {
+    fs.mkdirSync(DATA_DIRECTORY, { recursive: true, mode: 0o700 });
+  }
+
+  [DATABASE_FILE, `${DATABASE_FILE}-wal`, `${DATABASE_FILE}-shm`, JSON_DATA_FILE]
+    .forEach((filePath) => hardenPrivatePath(filePath, "file"));
+}
+
+/**
  * Loads simple KEY=VALUE pairs from an optional local .env file without adding
  * a package dependency. Existing process environment variables always win, so
  * deployment shells and launch agents can provide the authoritative values.
@@ -103,8 +179,9 @@ function loadDotEnvFile(filePath) {
     return;
   }
 
+  hardenPrivatePath(filePath, "file");
   const contents = fs.readFileSync(filePath, "utf8");
-  contents.split(/\r?\n/).forEach((line) => {
+  contents.split(/\r?\n/).forEach((line, lineIndex) => {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) {
       return;
@@ -112,10 +189,13 @@ function loadDotEnvFile(filePath) {
 
     const separator = trimmed.indexOf("=");
     if (separator < 1) {
-      return;
+      throw new Error(`Invalid .env entry on line ${lineIndex + 1}. Expected KEY=VALUE.`);
     }
 
     const key = trimmed.slice(0, separator).trim();
+    if (!ALLOWED_DOT_ENV_KEYS.has(key)) {
+      throw new Error(`Unsupported .env key on line ${lineIndex + 1}: ${key}.`);
+    }
     let value = trimmed.slice(separator + 1).trim();
     if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
       value = value.slice(1, -1);
@@ -125,6 +205,70 @@ function loadDotEnvFile(filePath) {
       process.env[key] = value;
     }
   });
+}
+
+/**
+ * Parses one strict boolean environment value. Only literal true/false values
+ * are accepted so a typo can never silently disable TLS verification.
+ *
+ * @param {string} name Environment variable name.
+ * @param {boolean} defaultValue Value used when the variable is absent.
+ * @returns {boolean} The validated boolean value.
+ */
+function parseBooleanEnvironment(name, defaultValue) {
+  const rawValue = process.env[name];
+  if (typeof rawValue === "undefined" || rawValue === "") {
+    return defaultValue;
+  }
+  if (rawValue === "true") {
+    return true;
+  }
+  if (rawValue === "false") {
+    return false;
+  }
+
+  throw new Error(`${name} must be either true or false.`);
+}
+
+/**
+ * Parses the configured router origin without permitting URL credentials,
+ * query strings, fragments, or non-HTTP protocols. Keeping credentials in
+ * dedicated variables prevents them from appearing in logs and URL errors.
+ *
+ * @param {string|undefined} rawValue Configured router URL.
+ * @returns {URL} A normalized HTTP(S) router origin.
+ */
+function parseRouterUrl(rawValue) {
+  const routerUrl = new URL(rawValue || "https://192.168.100.1");
+  if (routerUrl.protocol !== "http:" && routerUrl.protocol !== "https:") {
+    throw new Error("ROUTER_URL must use http:// or https://.");
+  }
+  if (routerUrl.username || routerUrl.password) {
+    throw new Error("ROUTER_URL must not contain credentials; use ROUTER_USERNAME and ROUTER_PASSWORD.");
+  }
+  if (routerUrl.search || routerUrl.hash || (routerUrl.pathname && routerUrl.pathname !== "/")) {
+    throw new Error("ROUTER_URL must contain only the router origin, without a path, query, or fragment.");
+  }
+
+  routerUrl.pathname = "/";
+  return routerUrl;
+}
+
+/**
+ * Validates that an IANA timezone identifier can be used for billing calendar
+ * keys before the background collector starts writing samples.
+ *
+ * @param {string} timezone Configured IANA timezone identifier.
+ * @returns {string} The validated identifier.
+ */
+function validateUsageTimezone(timezone) {
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: timezone }).format(new Date(0));
+  } catch (error) {
+    throw new Error(`USAGE_TIMEZONE is not a valid IANA timezone: ${timezone}.`);
+  }
+
+  return timezone;
 }
 
 /**
@@ -138,18 +282,32 @@ function getConfig() {
     return cachedConfig;
   }
 
-  loadDotEnvFile(path.join(ROOT_DIRECTORY, ".env"));
-  const routerUrl = new URL(process.env.ROUTER_URL || "https://192.168.100.1:80");
+  loadDotEnvFile(ENVIRONMENT_FILE);
+  const routerUrl = parseRouterUrl(process.env.ROUTER_URL);
   const configuredPort = Number.parseInt(process.env.PORT || "3000", 10);
+  const routerUsername = process.env.ROUTER_USERNAME || "root";
+  const routerPassword = process.env.ROUTER_PASSWORD || "";
+  const usageTimezone = process.env.USAGE_TIMEZONE || "Africa/Lagos";
+
+  if (!Number.isInteger(configuredPort) || configuredPort < 1 || configuredPort > 65_535
+    || String(configuredPort) !== String(process.env.PORT || "3000")) {
+    throw new Error("PORT must be an integer between 1 and 65535.");
+  }
+  if (!routerUsername || routerUsername.length > 256) {
+    throw new Error("ROUTER_USERNAME must contain between 1 and 256 characters.");
+  }
+  if (routerPassword.length > 1_024) {
+    throw new Error("ROUTER_PASSWORD must not exceed 1024 characters.");
+  }
 
   cachedConfig = {
-    port: Number.isFinite(configuredPort) ? configuredPort : 3000,
-    host: process.env.HOST || "127.0.0.1",
+    port: configuredPort,
+    host: "127.0.0.1",
     routerUrl,
-    routerUsername: process.env.ROUTER_USERNAME || "root",
-    routerPassword: process.env.ROUTER_PASSWORD || "",
-    allowInsecureTls: process.env.ROUTER_INSECURE_TLS !== "false",
-    usageTimezone: process.env.USAGE_TIMEZONE || "Africa/Lagos",
+    routerUsername,
+    routerPassword,
+    allowInsecureTls: parseBooleanEnvironment("ROUTER_INSECURE_TLS", false),
+    usageTimezone: validateUsageTimezone(usageTimezone),
     collectionIntervalMs: COLLECTION_INTERVAL_MS,
   };
 
@@ -268,6 +426,9 @@ function getStorageBackend() {
     getDatabase();
     storageBackend = "sqlite";
   } catch (error) {
+    if (error && error.code === "ERR_FIBERX_UNSAFE_PATH") {
+      throw error;
+    }
     storageBackend = "json";
     const reason = error instanceof Error ? error.message : "SQLite initialization failed.";
     console.warn(`FiberX storage: SQLite is unavailable (${reason}); using ${JSON_DATA_FILE}.`);
@@ -285,6 +446,7 @@ function getStorageBackend() {
  */
 async function readStoreFromJson() {
   try {
+    hardenPrivatePath(JSON_DATA_FILE, "file");
     const contents = await fsPromises.readFile(JSON_DATA_FILE, "utf8");
     return normalizeStore(JSON.parse(contents));
   } catch (error) {
@@ -305,11 +467,23 @@ async function readStoreFromJson() {
  * @returns {Promise<void>} Resolves after the JSON file has been replaced.
  */
 async function writeStoreToJson(store) {
-  await fsPromises.mkdir(DATA_DIRECTORY, { recursive: true });
+  preparePrivateStorage();
   const serialized = `${JSON.stringify(store, null, 2)}\n`;
-  const temporaryFile = `${JSON_DATA_FILE}.tmp`;
-  await fsPromises.writeFile(temporaryFile, serialized, "utf8");
-  await fsPromises.rename(temporaryFile, JSON_DATA_FILE);
+  const temporaryFile = path.join(DATA_DIRECTORY, `.usage-${process.pid}-${crypto.randomUUID()}.tmp`);
+
+  try {
+    await fsPromises.writeFile(temporaryFile, serialized, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    await fsPromises.rename(temporaryFile, JSON_DATA_FILE);
+    hardenPrivatePath(JSON_DATA_FILE, "file");
+  } finally {
+    try {
+      await fsPromises.unlink(temporaryFile);
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
 }
 
 /**
@@ -328,7 +502,7 @@ function getDatabase() {
     throw new Error("SQLite storage requires Node.js 22.5 or newer with node:sqlite enabled.");
   }
 
-  fs.mkdirSync(DATA_DIRECTORY, { recursive: true });
+  preparePrivateStorage();
   const database = new DatabaseSync(DATABASE_FILE);
 
   try {
@@ -414,6 +588,7 @@ function getDatabase() {
     `).run(String(DATABASE_SCHEMA_VERSION));
 
     migrateLegacyJson(database);
+    preparePrivateStorage();
     sqliteDatabase = database;
     return sqliteDatabase;
   } catch (error) {

@@ -22,7 +22,7 @@ The dashboard also checks the Huawei connected-client resources and displays the
 Use Node.js 18 or newer. Node.js 22.5 or newer uses the built-in `node:sqlite` API; older supported runtimes automatically use JSON. No package installation is required.
 
 1. Change the router's default password in the Huawei web UI first.
-2. Copy `.env.example` to `.env` and set `ROUTER_PASSWORD` to the new password, or export the variables in your shell.
+2. Copy `.env.example` to `.env`, restrict it to your OS account with `chmod 600 .env`, and set `ROUTER_PASSWORD` to the new password. You can export the variables in your shell instead if you do not want a credential file.
 3. Start the server:
 
 ```sh
@@ -31,7 +31,7 @@ node server.js
 
 4. Open [http://127.0.0.1:3000](http://127.0.0.1:3000).
 
-The router uses a self-signed certificate, so `ROUTER_INSECURE_TLS=true` is enabled for the local router connection by default. The dashboard server binds to `127.0.0.1` only.
+TLS certificate verification is enabled by default. If your router uses a self-signed certificate and HTTPS cannot be verified, `ROUTER_INSECURE_TLS=true` is an explicit local-network exception; it makes the router login vulnerable to interception by another device on that network. The dashboard server is hard-bound to `127.0.0.1` and does not accept a configurable public bind address.
 
 The server-owned 30-second collector is not realtime streaming. It reads cumulative router counters on each poll and records the interval delta, so the latest value can be up to one polling interval old. The device table uses the same cadence when per-device counters are available.
 
@@ -64,5 +64,5 @@ If the dashboard reports that the router reset the connection, stop the server, 
 - If the router reboots or resets its counters, the next sample is treated as a new interval instead of creating a negative number.
 - A shutdown, sleep period, router outage, or stopped server creates an offline interval. If the router counters continue increasing, the next successful sample reconciles the difference and labels it in the dashboard as usage while away.
 - If the router reboots or resets its counters during that interval, the tracker flags the gap and cannot reliably reconstruct the missing usage.
-- Plan settings and history are local to this checkout. The SQLite database, its WAL files, and the JSON fallback/backup are ignored by Git.
+- Plan settings and history are local to this checkout. The SQLite database, its WAL files, and the JSON fallback/backup are ignored by Git and restricted to the current OS account.
 - Use the dashboard's Export CSV button to export the selected month.
