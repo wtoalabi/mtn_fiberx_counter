@@ -62,6 +62,80 @@ private struct FiberXSettings: Decodable {
     let capGb: Double?
 }
 
+/// Renders one high-contrast label/value row inside the native status-item
+/// menu. Custom views avoid the muted appearance macOS applies to disabled
+/// informational menu items while preserving the system menu background.
+private final class FiberXMenuRowView: NSView {
+    /// The left-aligned metric label.
+    private let labelField: NSTextField
+
+    /// The right-aligned metric value.
+    private let valueField: NSTextField
+
+    /// Creates a menu row with semibold, full-contrast typography.
+    ///
+    /// - Parameters:
+    ///   - label: The descriptive label shown on the left.
+    ///   - value: The initial value shown on the right.
+    init(label: String, value: String) {
+        labelField = NSTextField(labelWithString: label)
+        valueField = NSTextField(labelWithString: value)
+        super.init(frame: .zero)
+        configureLayout()
+    }
+
+    /// Supports AppKit's required coder initializer for completeness; rows are
+    /// created programmatically and are not decoded from a storyboard.
+    ///
+    /// - Parameter coder: The coder supplied by AppKit.
+    required init?(coder: NSCoder) {
+        labelField = NSTextField(labelWithString: "")
+        valueField = NSTextField(labelWithString: "")
+        super.init(coder: coder)
+        configureLayout()
+    }
+
+    /// Updates the right-hand value while retaining the row's typography.
+    ///
+    /// - Parameters:
+    ///   - value: New value text.
+    ///   - color: Optional value color, useful for connection state.
+    func update(value: String, color: NSColor? = nil) {
+        valueField.stringValue = value
+        if let color {
+            valueField.textColor = color
+        }
+    }
+
+    /// Configures the fixed-width menu row and its two-column Auto Layout.
+    private func configureLayout() {
+        translatesAutoresizingMaskIntoConstraints = false
+        labelField.translatesAutoresizingMaskIntoConstraints = false
+        valueField.translatesAutoresizingMaskIntoConstraints = false
+
+        labelField.font = NSFont.systemFont(ofSize: 14, weight: .medium)
+        labelField.textColor = NSColor.labelColor
+        labelField.lineBreakMode = .byTruncatingTail
+
+        valueField.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        valueField.textColor = NSColor.labelColor
+        valueField.alignment = .right
+        valueField.lineBreakMode = .byTruncatingHead
+
+        addSubview(labelField)
+        addSubview(valueField)
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 430),
+            heightAnchor.constraint(equalToConstant: 32),
+            labelField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            labelField.centerYAnchor.constraint(equalTo: centerYAnchor),
+            valueField.leadingAnchor.constraint(greaterThanOrEqualTo: labelField.trailingAnchor, constant: 12),
+            valueField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            valueField.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+}
+
 /// Provides a lightweight, menu-bar-only companion for the local FiberX web
 /// dashboard. The Node server remains responsible for router collection; this
 /// process authenticates to the existing localhost API and presents a compact
@@ -73,35 +147,35 @@ final class FiberXMenuBarController: NSObject, NSApplicationDelegate, NSMenuDele
     /// The menu shown when the status item is clicked.
     private var menu: NSMenu?
 
-    /// The read-only menu row reporting the collector's local service state.
-    private var serviceStatusItem: NSMenuItem?
+    /// The high-contrast row reporting the collector's local service state.
+    private var serviceStatusRow: FiberXMenuRowView?
 
-    /// The read-only menu row reporting the last router state.
-    private var routerStatusItem: NSMenuItem?
+    /// The high-contrast row reporting the last router state.
+    private var routerStatusRow: FiberXMenuRowView?
 
-    /// The menu row reporting current-month usage.
-    private var totalUsageItem: NSMenuItem?
+    /// The high-contrast row reporting current-month usage.
+    private var totalUsageRow: FiberXMenuRowView?
 
-    /// The menu row reporting current-day usage.
-    private var todayUsageItem: NSMenuItem?
+    /// The high-contrast row reporting current-day usage.
+    private var todayUsageRow: FiberXMenuRowView?
 
-    /// The menu row reporting the latest interval-average transfer rate.
-    private var speedItem: NSMenuItem?
+    /// The high-contrast row reporting the latest interval-average transfer rate.
+    private var speedRow: FiberXMenuRowView?
 
-    /// The menu row reporting the month-average usage rate.
-    private var averageItem: NSMenuItem?
+    /// The high-contrast row reporting the month-average usage rate.
+    private var averageRow: FiberXMenuRowView?
 
-    /// The menu row reporting the projected month-end usage.
-    private var projectedItem: NSMenuItem?
+    /// The high-contrast row reporting the projected month-end usage.
+    private var projectedRow: FiberXMenuRowView?
 
-    /// The menu row reporting the configured plan.
-    private var planItem: NSMenuItem?
+    /// The high-contrast row reporting the configured plan.
+    private var planRow: FiberXMenuRowView?
 
-    /// The menu row reporting the timestamp of the last router sample.
-    private var lastSyncItem: NSMenuItem?
+    /// The high-contrast row reporting the timestamp of the last router sample.
+    private var lastSyncRow: FiberXMenuRowView?
 
-    /// The menu row used to surface an authentication or data-read failure.
-    private var dataStatusItem: NSMenuItem?
+    /// The high-contrast row used to surface an authentication or data-read failure.
+    private var dataStatusRow: FiberXMenuRowView?
 
     /// The in-flight health request, retained so it can be cancelled on exit.
     private var healthRequest: URLSessionDataTask?
@@ -177,24 +251,24 @@ final class FiberXMenuBarController: NSObject, NSApplicationDelegate, NSMenuDele
         fiberXMenu.autoenablesItems = false
         fiberXMenu.delegate = self
 
-        let headerItem = makeReadOnlyMenuItem(title: "FiberX", in: fiberXMenu)
+        let headerItem = makeMenuHeaderItem(in: fiberXMenu)
         headerItem.attributedTitle = NSAttributedString(
             string: "FiberX",
             attributes: [.font: NSFont.boldSystemFont(ofSize: 14)]
         )
 
-        serviceStatusItem = makeReadOnlyMenuItem(title: "Service: Checking…", in: fiberXMenu)
-        routerStatusItem = makeReadOnlyMenuItem(title: "Router: Waiting for sync", in: fiberXMenu)
+        serviceStatusRow = makeMetricRow(label: "Service", value: "Checking…", in: fiberXMenu)
+        routerStatusRow = makeMetricRow(label: "Router", value: "Waiting for sync", in: fiberXMenu)
         fiberXMenu.addItem(NSMenuItem.separator())
 
-        totalUsageItem = makeReadOnlyMenuItem(title: "Total this month: --", in: fiberXMenu)
-        todayUsageItem = makeReadOnlyMenuItem(title: "Today: --", in: fiberXMenu)
-        speedItem = makeReadOnlyMenuItem(title: "Recent speed: --", in: fiberXMenu)
-        averageItem = makeReadOnlyMenuItem(title: "Daily average: --", in: fiberXMenu)
-        projectedItem = makeReadOnlyMenuItem(title: "Projected month end: --", in: fiberXMenu)
-        planItem = makeReadOnlyMenuItem(title: "Plan: --", in: fiberXMenu)
-        lastSyncItem = makeReadOnlyMenuItem(title: "Last sync: --", in: fiberXMenu)
-        dataStatusItem = makeReadOnlyMenuItem(title: "Data: Open the menu to refresh", in: fiberXMenu)
+        totalUsageRow = makeMetricRow(label: "Total this month", value: "--", in: fiberXMenu)
+        todayUsageRow = makeMetricRow(label: "Today", value: "--", in: fiberXMenu)
+        speedRow = makeMetricRow(label: "Recent speed", value: "--", in: fiberXMenu)
+        averageRow = makeMetricRow(label: "Daily average", value: "--", in: fiberXMenu)
+        projectedRow = makeMetricRow(label: "Projected month end", value: "--", in: fiberXMenu)
+        planRow = makeMetricRow(label: "Plan", value: "--", in: fiberXMenu)
+        lastSyncRow = makeMetricRow(label: "Last sync", value: "--", in: fiberXMenu)
+        dataStatusRow = makeMetricRow(label: "Data", value: "Open the menu to refresh", in: fiberXMenu)
 
         fiberXMenu.addItem(NSMenuItem.separator())
 
@@ -244,15 +318,28 @@ final class FiberXMenuBarController: NSObject, NSApplicationDelegate, NSMenuDele
         statusItem?.menu = fiberXMenu
     }
 
-    /// Creates and inserts one disabled informational row in the dropdown.
+    /// Creates and inserts one full-contrast informational row in the dropdown.
     ///
     /// - Parameters:
-    ///   - title: The initial row title shown before the first API response.
+    ///   - label: The left-hand label shown before the first API response.
+    ///   - value: The right-hand value shown before the first API response.
     ///   - menu: The dropdown receiving the row.
-    /// - Returns: The newly inserted informational row.
-    private func makeReadOnlyMenuItem(title: String, in menu: NSMenu) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.isEnabled = false
+    /// - Returns: The newly inserted custom row view.
+    private func makeMetricRow(label: String, value: String, in menu: NSMenu) -> FiberXMenuRowView {
+        let row = FiberXMenuRowView(label: label, value: value)
+        let item = NSMenuItem()
+        item.view = row
+        menu.addItem(item)
+        return row
+    }
+
+    /// Creates the bold, full-contrast title row at the top of the dropdown.
+    ///
+    /// - Parameter menu: The dropdown receiving the title row.
+    /// - Returns: The title menu item so its typography can be customized.
+    private func makeMenuHeaderItem(in menu: NSMenu) -> NSMenuItem {
+        let item = NSMenuItem(title: "FiberX", action: nil, keyEquivalent: "")
+        item.isEnabled = true
         menu.addItem(item)
         return item
     }
@@ -277,7 +364,7 @@ final class FiberXMenuBarController: NSObject, NSApplicationDelegate, NSMenuDele
     /// Checks the unauthenticated health endpoint and updates the service row.
     private func refreshServiceStatus() {
         healthRequest?.cancel()
-        serviceStatusItem?.title = "Service: Checking…"
+        serviceStatusRow?.update(value: "Checking…", color: NSColor.secondaryLabelColor)
         statusItem?.button?.toolTip = "FiberX: checking service"
 
         var request = URLRequest(url: healthURL)
@@ -298,7 +385,10 @@ final class FiberXMenuBarController: NSObject, NSApplicationDelegate, NSMenuDele
     /// - Parameter isHealthy: Whether the local FiberX health endpoint answered
     ///   successfully.
     private func updateServiceStatus(isHealthy: Bool) {
-        serviceStatusItem?.title = isHealthy ? "Service: Running" : "Service: Not running"
+        serviceStatusRow?.update(
+            value: isHealthy ? "Running" : "Not running",
+            color: isHealthy ? NSColor.systemGreen : NSColor.systemOrange
+        )
         statusItem?.button?.toolTip = isHealthy
             ? "FiberX: service running"
             : "FiberX: service not running"
@@ -313,7 +403,7 @@ final class FiberXMenuBarController: NSObject, NSApplicationDelegate, NSMenuDele
         }
 
         isSummaryLoading = true
-        dataStatusItem?.title = "Data: Loading…"
+        dataStatusRow?.update(value: "Loading…", color: NSColor.secondaryLabelColor)
         fetchSummary(retryAfterLogin: false)
     }
 
@@ -394,29 +484,33 @@ final class FiberXMenuBarController: NSObject, NSApplicationDelegate, NSMenuDele
     ///
     /// - Parameter summary: The current-month usage summary returned by FiberX.
     private func renderSummary(_ summary: FiberXSummary) {
-        totalUsageItem?.title = "Total this month: \(formatBytes(summary.totalUsageBytes))"
-        todayUsageItem?.title = "Today: \(formatBytes(summary.todayUsageBytes))"
-        averageItem?.title = "Daily average: \(formatBytes(summary.dailyAverageBytes))/day"
-        projectedItem?.title = "Projected month end: \(formatBytes(summary.projectedMonthEndBytes))"
-        lastSyncItem?.title = "Last sync: \(formatTimestamp(summary.lastSyncAt))"
+        totalUsageRow?.update(value: formatBytes(summary.totalUsageBytes), color: NSColor.controlAccentColor)
+        todayUsageRow?.update(value: formatBytes(summary.todayUsageBytes), color: NSColor.controlAccentColor)
+        averageRow?.update(value: "\(formatBytes(summary.dailyAverageBytes))/day")
+        projectedRow?.update(value: formatBytes(summary.projectedMonthEndBytes))
+        lastSyncRow?.update(value: formatTimestamp(summary.lastSyncAt), color: NSColor.secondaryLabelColor)
 
         if let speed = summary.speed, speed.available {
-            speedItem?.title = "Recent speed: ↓ \(formatRate(speed.rxBytesPerSecond))  ↑ \(formatRate(speed.txBytesPerSecond))"
+            speedRow?.update(
+                value: "↓ \(formatRate(speed.rxBytesPerSecond))  ↑ \(formatRate(speed.txBytesPerSecond))",
+                color: NSColor.controlAccentColor
+            )
         } else {
-            speedItem?.title = "Recent speed: waiting for another sample"
+            speedRow?.update(value: "Waiting for another sample", color: NSColor.secondaryLabelColor)
         }
 
         if let settings = summary.settings, settings.planMode == "capped" {
             let cap = settings.capGb.map { String(format: "%.0f GB cap", $0) } ?? "cap configured"
-            planItem?.title = "Plan: Capped (\(cap))"
+            planRow?.update(value: "Capped (\(cap))")
         } else {
-            planItem?.title = "Plan: Unlimited"
+            planRow?.update(value: "Unlimited")
         }
 
-        routerStatusItem?.title = summary.router?.connected == true
-            ? "Router: Connected"
-            : "Router: Last sync unavailable"
-        dataStatusItem?.title = "Data: Updated"
+        routerStatusRow?.update(
+            value: summary.router?.connected == true ? "Connected" : "Last sync unavailable",
+            color: summary.router?.connected == true ? NSColor.systemGreen : NSColor.systemOrange
+        )
+        dataStatusRow?.update(value: "Updated", color: NSColor.systemGreen)
     }
 
     /// Marks the summary rows as unavailable without exposing request details
@@ -426,7 +520,7 @@ final class FiberXMenuBarController: NSObject, NSApplicationDelegate, NSMenuDele
     private func finishSummaryWithError(_ message: String) {
         isSummaryLoading = false
         dataRequest = nil
-        dataStatusItem?.title = "Data: \(message)"
+        dataStatusRow?.update(value: message, color: NSColor.systemOrange)
     }
 
     /// Restarts the existing FiberX LaunchAgent without starting a second
