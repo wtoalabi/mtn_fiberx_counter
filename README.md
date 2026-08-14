@@ -1,72 +1,94 @@
 # MTN FiberX Data Tracker
 
-This is a localhost dashboard that recreates the dark MTN usage view from the reference image and backs it with the Huawei HG8145X7-10 WAN counters exposed by the MTN FiberX router.
+FiberX is a small, local-first dashboard for tracking usage from an MTN FiberX router. It polls the cumulative WAN counters exposed by a Huawei HG8145X7-10 router, turns the counter changes into daily history, and keeps the data on your computer.
 
-## How it works
+It does not use a cloud service, and it does not need a package install.
 
-The router does not expose a ready-made monthly usage history. Its embedded UI exposes cumulative WAN statistics instead:
+![FiberX sign-in screen](docs/images/fiberx-login.png)
 
-- `/html/bbsp/common/get_wan_list_ipwanstat.asp`
-- `/html/bbsp/common/get_wan_list_pppwanstat.asp`
+![FiberX dashboard](docs/images/fiberx-dashboard.png)
 
-The local Node server logs into the router, reads RX/TX bytes, calculates the delta since the previous sample, and stores settings and history in `data/fiberx.sqlite`. A JSON backend remains available as a recovery fallback if the built-in SQLite API is unavailable. Database migration errors stop startup instead of silently splitting future samples into another backend. The browser only talks to `127.0.0.1`, so the router password is never sent to the browser or committed to this project.
+## What it does
 
-On first startup with SQLite available, an existing `data/usage.json` is imported automatically and left untouched as a recoverable backup. When SQLite is unavailable, the JSON file remains the active store.
+- Records download and upload usage from the router's cumulative WAN counters.
+- Shows monthly totals, latest-day usage, daily averages, projections, and a daily chart.
+- Lets you switch between an unlimited plan and a capped plan.
+- Exports the selected month as CSV.
+- Shows connected-device identity and Wi-Fi link details when the router provides them.
+- Keeps collecting every 30 seconds while the local server is running, even when the browser is closed.
+- Stores history locally in SQLite, with a JSON fallback for recovery.
+- Protects the dashboard with a local password and an HttpOnly session cookie.
 
-The first sync establishes a baseline and records zero usage. The server samples the router every 30 seconds, so the history collector continues running even when the dashboard tab is closed.
+## Requirements
 
-The dashboard also checks the Huawei connected-client resources and displays the device name/host, IP or MAC address, SSID, connection duration, negotiated RX/TX Wi-Fi link rates, and signal strength when the firmware returns them. These are link rates, not current internet throughput. This HG8145X7-10 response exposes per-station rates but does not expose per-station byte counters, so exact device usage cannot be calculated from this router. The collector is ready to calculate monthly RX/TX counter deltas automatically if a future firmware response includes those counters; until then the device table correctly shows `Not exposed`.
+- Node.js `24.18.1` or newer within the Node 24 LTS line.
+- A Huawei router with the WAN statistics endpoints used by MTN FiberX. The project is tested with the HG8145X7-10.
+- macOS only if you want to use the included background launcher.
 
-## Run it
+FiberX uses Node's built-in APIs. There is no `npm install` step.
 
-Use the latest patched Node.js 24 LTS release. The enforced minimum is Node.js 24.18.1, which includes the July 2026 security fixes; `.nvmrc` selects the newest available 24.x patch through common version managers. FiberX uses the built-in `node:sqlite` API and retains JSON as a recovery fallback. No package installation is required.
-
-1. Change the router's default password in the Huawei web UI first.
-2. Copy `.env.example` to `.env`, restrict it to your OS account with `chmod 600 .env`, replace both password placeholders, and keep `DASHBOARD_PASSWORD` unique to this dashboard. You can export the variables in your shell instead if you do not want a credential file.
-3. Start the server:
+## Quick start
 
 ```sh
+git clone https://github.com/wtoalabi/mtn_fiberx_counter.git
+cd mtn_fiberx_counter
+cp .env.example .env
+chmod 600 .env
+```
+
+Open `.env` and set:
+
+- `DASHBOARD_PASSWORD`: a unique password with at least 20 characters. Do not reuse the router password.
+- `ROUTER_URL`, `ROUTER_USERNAME`, and `ROUTER_PASSWORD`: the local router connection details.
+- `USAGE_TIMEZONE`: the timezone used when grouping samples into days.
+
+For a self-signed HTTPS certificate, set `ROUTER_TLS_FINGERPRINT256` to the verified SHA-256 fingerprint. Keep `ROUTER_INSECURE_TLS` and `ROUTER_ALLOW_PLAINTEXT_HTTP` set to `false` unless you understand the risk and have no safer option.
+
+Validate the configuration, then start FiberX:
+
+```sh
+node server.js --check-config
 node server.js
 ```
 
-Use `node server.js --check-config` to validate `.env` without opening a port or contacting the router. The macOS launcher runs this check before it replaces an existing service.
+Open [http://127.0.0.1:3000](http://127.0.0.1:3000) and sign in with `DASHBOARD_PASSWORD`.
 
-4. Open [http://127.0.0.1:3000](http://127.0.0.1:3000). FiberX shows an in-app sign-in page and uses the `DASHBOARD_PASSWORD` value from `.env`; there is no browser-native HTTP Basic prompt. After a successful sign-in, the server issues a 30-day, HttpOnly, SameSite session cookie containing no password material. Restarting the server invalidates existing sessions. Never reuse the router password.
-
-TLS certificate verification is enabled by default. For a self-signed router certificate, prefer setting `ROUTER_TLS_FINGERPRINT256` to the verified SHA-256 fingerprint of the router's leaf certificate; FiberX checks the pin before transmitting the login request. `ROUTER_INSECURE_TLS=true` remains an explicit last-resort exception and makes the router login vulnerable to interception by another device on that network. A plaintext `http://` router URL is rejected unless `ROUTER_ALLOW_PLAINTEXT_HTTP=true` is also explicitly set. The dashboard server is hard-bound to `127.0.0.1` and does not accept a configurable public bind address.
-
-The server-owned 30-second collector is not realtime streaming. It reads cumulative router counters on each poll and records the interval delta, so the latest value can be up to one polling interval old. Exact WAN deltas are compacted into one row per day, and available per-device deltas into one row per device per month, so leaving the collector running does not create an unbounded stream of database rows. A compromised router cannot rotate more than 2,048 stored device identities per month; established devices with the most observations take precedence while WAN totals remain exact. The device table uses the same polling cadence when per-device counters are available.
-
-All dashboard routes except the data-free `/healthz` probe require an active session, including the dashboard HTML and data APIs. The unauthenticated sign-in shell exposes only its own HTML, stylesheet, and login script; it cannot read telemetry. GET endpoints are read-only. Manual router synchronization, settings changes, and sign-in use same-origin JSON POST requests. The server validates the exact loopback `Host` and browser origin, rejects cross-site API requests, and sends a restrictive browser security policy to defend the local service against local multi-user access, DNS rebinding, CSRF, framing, and content-type confusion.
+The full setup and usage instructions are in the [user guide](docs/USER_GUIDE.md).
 
 ## Run in the background on macOS
 
-Closing the browser does not stop collection as long as `node server.js` remains running. A full laptop shutdown does stop live sampling. When the laptop returns, the collector subtracts the last persisted router counter from the latest counter and records the difference as an offline-gap reconciliation. The exact time distribution is unknown, so the amount is assigned to the return sample. The generated LaunchAgent starts the server at login and restarts it if it exits, so collection resumes after the laptop starts again.
-
-Use the included one-command launcher. It discovers the Node.js path, generates the LaunchAgent for this checkout, installs it, starts `server.js` through launchd, and verifies the local dashboard:
+The included launcher installs a per-user LaunchAgent and keeps the collector running after the browser is closed:
 
 ```sh
 ./start-fiberx.sh
 ```
 
-If macOS says the script is not executable, run this once and then run the launcher:
+The launcher checks the Node.js version and configuration, starts the service at login, and verifies the local dashboard. Logs are written to `~/Library/Logs/FiberX/`.
+
+## How usage is measured
+
+The router exposes cumulative receive (RX) and transmit (TX) byte counters, not a ready-made monthly history. FiberX samples those counters and records the difference between successful samples. The first successful sample establishes a baseline, so it records zero usage by design. Later samples are grouped by day and month.
+
+If the router resets its counters, FiberX starts a new interval instead of creating a negative usage value. If the computer or router is unavailable, the next successful sample may be labelled as an offline gap; if the router also reset its counters, that missing usage cannot be reconstructed.
+
+The connected-device view reports identity, address, connection type, duration, negotiated link rates, and signal when available. Link rates are not current internet throughput. The tested firmware does not expose per-device byte counters, so the device table normally shows `Not exposed` for per-device usage while the WAN total remains available.
+
+## Privacy and security
+
+FiberX binds to `127.0.0.1`, keeps router credentials on the local machine, and stores history in the local `data/` directory. `.env` and `data/` are ignored by Git. Never commit them, exported CSV files, logs, or screenshots containing device names, IP addresses, or MAC addresses.
+
+Read [SECURITY.md](SECURITY.md) before opening a security issue. MTN and Huawei names identify compatible equipment; this project is not affiliated with either company.
+
+## Development
+
+The application is dependency-free. A lightweight syntax check is available:
 
 ```sh
-chmod +x ./start-fiberx.sh
-./start-fiberx.sh
+npm run check
 ```
 
-The generated plist is stored at `~/Library/LaunchAgents/com.mtn.fiberx.tracker.plist`. The script is safe to run again after moving Node or changing the project path; it refreshes the plist and restarts the same service. Logs go to `~/Library/Logs/FiberX/server.log` and `~/Library/Logs/FiberX/server-error.log`.
+Please keep credentials, router responses, local databases, and personal device information out of commits and issue attachments.
 
-Do not leave a manually started `node server.js` running when you run the launcher. If the configured dashboard port is already occupied, the script stops and tells you which process must be stopped; it never kills an existing process automatically.
+## License
 
-If the dashboard reports that the router reset the connection, stop the server, wait for the Huawei login lockout timer to clear, verify that `ROUTER_PASSWORD` in `.env` matches the current router password, and start the server again. The collector pauses repeated login attempts after a failure so a wrong password does not continuously lock the router.
-
-## Notes
-
-- This tracks the cumulative WAN PPP/IP counters, so it cannot reconstruct days from before the first baseline.
-- If the router reboots or resets its counters, the next sample is treated as a new interval instead of creating a negative number.
-- A shutdown, sleep period, router outage, or stopped server creates an offline interval. If the router counters continue increasing, the next successful sample reconciles the difference and labels it in the dashboard as usage while away.
-- If the router reboots or resets its counters during that interval, the tracker flags the gap and cannot reliably reconstruct the missing usage.
-- Plan settings and history are local to this checkout. The SQLite database, its WAL files, and the JSON fallback/backup are ignored by Git and restricted to the current OS account.
-- Use the dashboard's Export CSV button to export the selected month.
+FiberX is released under the [MIT License](LICENSE).
