@@ -31,8 +31,10 @@ const ALLOWED_DOT_ENV_KEYS = new Set([
   "DASHBOARD_PASSWORD",
   "DASHBOARD_USERNAME",
   "PORT",
+  "ROUTER_ALLOW_PLAINTEXT_HTTP",
   "ROUTER_INSECURE_TLS",
   "ROUTER_PASSWORD",
+  "ROUTER_TLS_FINGERPRINT256",
   "ROUTER_URL",
   "ROUTER_USERNAME",
   "USAGE_TIMEZONE",
@@ -394,6 +396,26 @@ function validateUsageTimezone(timezone) {
 }
 
 /**
+ * Normalizes an optional SHA-256 certificate fingerprint used to authenticate
+ * a self-signed router certificate. Colons and ASCII whitespace are accepted
+ * for compatibility with browser and OpenSSL fingerprint displays.
+ *
+ * @param {string|undefined} rawValue Configured leaf-certificate fingerprint.
+ * @returns {string|null} Uppercase 64-character hex digest, or null when absent.
+ */
+function parseTlsFingerprint(rawValue) {
+  if (!rawValue) {
+    return null;
+  }
+
+  const fingerprint = String(rawValue).replace(/[:\s]/g, "").toUpperCase();
+  if (!/^[A-F0-9]{64}$/.test(fingerprint)) {
+    throw new Error("ROUTER_TLS_FINGERPRINT256 must be a SHA-256 certificate fingerprint.");
+  }
+  return fingerprint;
+}
+
+/**
  * Loads an operator-supplied dashboard password or creates a high-entropy local
  * password on first launch. The generated secret is stored outside Git with
  * owner-only permissions and can be rotated by deleting the file while FiberX
@@ -432,7 +454,7 @@ function getDashboardPassword() {
  * Reads and validates runtime configuration while deliberately excluding the
  * router password from any object that is logged or returned to the browser.
  *
- * @returns {{port:number,host:string,dashboardUsername:string,dashboardPassword:string,routerUrl:URL,routerUsername:string,routerPassword:string,allowInsecureTls:boolean,usageTimezone:string,collectionIntervalMs:number}} Runtime configuration.
+ * @returns {{port:number,host:string,dashboardUsername:string,dashboardPassword:string,routerUrl:URL,routerUsername:string,routerPassword:string,allowInsecureTls:boolean,allowPlaintextHttp:boolean,routerTlsFingerprint:string|null,usageTimezone:string,collectionIntervalMs:number}} Runtime configuration.
  */
 function getConfig() {
   if (cachedConfig) {
@@ -447,6 +469,9 @@ function getConfig() {
   const routerUsername = process.env.ROUTER_USERNAME || "root";
   const routerPassword = process.env.ROUTER_PASSWORD || "";
   const usageTimezone = process.env.USAGE_TIMEZONE || "Africa/Lagos";
+  const allowInsecureTls = parseBooleanEnvironment("ROUTER_INSECURE_TLS", false);
+  const allowPlaintextHttp = parseBooleanEnvironment("ROUTER_ALLOW_PLAINTEXT_HTTP", false);
+  const routerTlsFingerprint = parseTlsFingerprint(process.env.ROUTER_TLS_FINGERPRINT256);
 
   if (!Number.isInteger(configuredPort) || configuredPort < 1 || configuredPort > 65_535
     || String(configuredPort) !== String(process.env.PORT || "3000")) {
@@ -467,6 +492,15 @@ function getConfig() {
   if (routerPassword && dashboardPassword === routerPassword) {
     throw new Error("DASHBOARD_PASSWORD must not reuse ROUTER_PASSWORD.");
   }
+  if (routerUrl.protocol === "http:" && !allowPlaintextHttp) {
+    throw new Error("ROUTER_URL uses plaintext HTTP. Set ROUTER_ALLOW_PLAINTEXT_HTTP=true only if this risk is unavoidable.");
+  }
+  if (routerUrl.protocol !== "https:" && routerTlsFingerprint) {
+    throw new Error("ROUTER_TLS_FINGERPRINT256 can be used only with an https:// ROUTER_URL.");
+  }
+  if (allowInsecureTls && routerTlsFingerprint) {
+    throw new Error("Use either ROUTER_TLS_FINGERPRINT256 or ROUTER_INSECURE_TLS=true, not both.");
+  }
 
   cachedConfig = {
     port: configuredPort,
@@ -476,7 +510,9 @@ function getConfig() {
     routerUrl,
     routerUsername,
     routerPassword,
-    allowInsecureTls: parseBooleanEnvironment("ROUTER_INSECURE_TLS", false),
+    allowInsecureTls,
+    allowPlaintextHttp,
+    routerTlsFingerprint,
     usageTimezone: validateUsageTimezone(usageTimezone),
     collectionIntervalMs: COLLECTION_INTERVAL_MS,
   };
@@ -1838,7 +1874,7 @@ function requestRouter(pathname, options = {}) {
     lookup: lookupPrivateRouterAddress,
   };
   if (target.protocol === "https:") {
-    requestOptions.rejectUnauthorized = !config.allowInsecureTls;
+    requestOptions.rejectUnauthorized = !config.allowInsecureTls && !config.routerTlsFingerprint;
   }
 
   return new Promise((resolve, reject) => {
@@ -1875,10 +1911,52 @@ function requestRouter(pathname, options = {}) {
 
     request.setTimeout(timeoutMs, () => request.destroy(new Error("Router request timed out.")));
     request.on("error", (error) => reject(formatRouterRequestError(pathname, error)));
+    sendRouterRequest(request, body, config.routerTlsFingerprint);
+  });
+}
+
+/**
+ * Sends a router request immediately for verified/default TLS and plaintext
+ * connections, or waits for a self-signed TLS handshake and validates its leaf
+ * certificate fingerprint before any headers, token, or password are written.
+ *
+ * @param {http.ClientRequest} request Prepared router request.
+ * @param {string} body Encoded request body.
+ * @param {string|null} expectedFingerprint Optional pinned SHA-256 fingerprint.
+ * @returns {void}
+ */
+function sendRouterRequest(request, body, expectedFingerprint) {
+  let sent = false;
+  const finishRequest = () => {
+    if (sent || request.destroyed) {
+      return;
+    }
+    sent = true;
     if (body) {
       request.write(body);
     }
     request.end();
+  };
+
+  if (!expectedFingerprint) {
+    finishRequest();
+    return;
+  }
+
+  request.once("socket", (socket) => {
+    socket.once("secureConnect", () => {
+      const certificate = socket.getPeerCertificate();
+      const actualFingerprint = String(certificate?.fingerprint256 || "").replace(/:/g, "").toUpperCase();
+      const actualBuffer = /^[A-F0-9]{64}$/.test(actualFingerprint)
+        ? Buffer.from(actualFingerprint, "hex")
+        : Buffer.alloc(32);
+      const expectedBuffer = Buffer.from(expectedFingerprint, "hex");
+      if (!crypto.timingSafeEqual(actualBuffer, expectedBuffer)) {
+        request.destroy(createRouterError("The router TLS certificate does not match ROUTER_TLS_FINGERPRINT256."));
+        return;
+      }
+      finishRequest();
+    });
   });
 }
 

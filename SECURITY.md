@@ -26,7 +26,7 @@ FiberX treats browser content, router responses, DNS answers, and other local OS
 - requires high-entropy HTTP Basic authentication for every data-bearing route;
 - keeps GET requests read-only and applies same-origin protections to API calls;
 - constrains router connections to private, loopback, and link-local addresses;
-- verifies router TLS certificates unless the operator explicitly opts into the documented self-signed-certificate exception;
+- verifies router TLS certificates, supports certificate pinning for self-signed routers, and requires explicit opt-ins for unverified TLS or plaintext HTTP;
 - bounds HTTP bodies, headers, router responses, cookies, and parser work; and
 - stores credentials and device history in owner-only, non-symlinked local files.
 

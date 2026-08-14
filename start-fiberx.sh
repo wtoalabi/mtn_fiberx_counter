@@ -40,7 +40,7 @@ die() {
 find_node_binary() {
   local discovered_node=""
   discovered_node="$(command -v node || true)"
-  [[ -n "$discovered_node" ]] || die "Node.js was not found. Install Node.js 18+ and run this script again."
+  [[ -n "$discovered_node" ]] || die "Node.js was not found. Install the latest Node.js 24 LTS release and run this script again."
   [[ -x "$discovered_node" ]] || die "The Node.js path is not executable: ${discovered_node}"
   FIBERX_NODE_BINARY="$discovered_node"
 }
