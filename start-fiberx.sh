@@ -291,7 +291,7 @@ start_launch_agent() {
 report_startup() {
   local attempt=1
   while (( attempt <= 10 )); do
-    if curl --silent --fail --max-time 1 "http://127.0.0.1:${FIBERX_PORT}/api/usage" >/dev/null 2>&1; then
+    if curl --silent --fail --max-time 1 "http://127.0.0.1:${FIBERX_PORT}/healthz" >/dev/null 2>&1; then
       printf 'FiberX is running through LaunchAgent %s.\n' "$SERVICE_LABEL"
       printf 'Dashboard: http://127.0.0.1:%s\n' "$FIBERX_PORT"
       printf 'Logs: %s/server.log and %s/server-error.log\n' "$LOG_DIRECTORY" "$LOG_DIRECTORY"

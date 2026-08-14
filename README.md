@@ -29,13 +29,13 @@ Use the latest patched Node.js 24 LTS release. The enforced minimum is Node.js 2
 node server.js
 ```
 
-4. Open [http://127.0.0.1:3000](http://127.0.0.1:3000).
+4. Open [http://127.0.0.1:3000](http://127.0.0.1:3000). The browser will request HTTP Basic authentication. The username defaults to `fiberx`; when `DASHBOARD_PASSWORD` is blank, FiberX creates a random password in `data/dashboard-password` with owner-only permissions. Read it locally with `cat data/dashboard-password`. Set a unique 20+ character `DASHBOARD_PASSWORD` in `.env` instead if you prefer a managed credential; never reuse the router password.
 
 TLS certificate verification is enabled by default. If your router uses a self-signed certificate and HTTPS cannot be verified, `ROUTER_INSECURE_TLS=true` is an explicit local-network exception; it makes the router login vulnerable to interception by another device on that network. The dashboard server is hard-bound to `127.0.0.1` and does not accept a configurable public bind address.
 
 The server-owned 30-second collector is not realtime streaming. It reads cumulative router counters on each poll and records the interval delta, so the latest value can be up to one polling interval old. The device table uses the same cadence when per-device counters are available.
 
-All dashboard GET endpoints are read-only. Manual router synchronization and settings changes use same-origin JSON POST requests. The server validates the exact loopback `Host` and browser origin, rejects cross-site API requests, and sends a restrictive browser security policy to defend the local service against DNS rebinding, CSRF, framing, and content-type confusion.
+All dashboard routes except the data-free `/healthz` probe require authentication, including static assets. GET endpoints are read-only. Manual router synchronization and settings changes use same-origin JSON POST requests. The server validates the exact loopback `Host` and browser origin, rejects cross-site API requests, and sends a restrictive browser security policy to defend the local service against local multi-user access, DNS rebinding, CSRF, framing, and content-type confusion.
 
 ## Run in the background on macOS
 

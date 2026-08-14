@@ -3,5 +3,6 @@
 data/*.json
 data/*.sqlite*
 data/.usage-*.tmp
+data/dashboard-password
 node_modules/
 npm-debug.log*

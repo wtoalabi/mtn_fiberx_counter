@@ -25,8 +25,11 @@ const ROOT_DIRECTORY = __dirname;
 const DATA_DIRECTORY = path.join(ROOT_DIRECTORY, "data");
 const ENVIRONMENT_FILE = path.join(ROOT_DIRECTORY, ".env");
 const DATABASE_FILE = path.join(DATA_DIRECTORY, "fiberx.sqlite");
+const DASHBOARD_PASSWORD_FILE = path.join(DATA_DIRECTORY, "dashboard-password");
 const JSON_DATA_FILE = path.join(DATA_DIRECTORY, "usage.json");
 const ALLOWED_DOT_ENV_KEYS = new Set([
+  "DASHBOARD_PASSWORD",
+  "DASHBOARD_USERNAME",
   "PORT",
   "ROUTER_INSECURE_TLS",
   "ROUTER_PASSWORD",
@@ -215,7 +218,7 @@ function preparePrivateStorage() {
     fs.mkdirSync(DATA_DIRECTORY, { recursive: true, mode: 0o700 });
   }
 
-  [DATABASE_FILE, `${DATABASE_FILE}-wal`, `${DATABASE_FILE}-shm`, JSON_DATA_FILE]
+  [DATABASE_FILE, `${DATABASE_FILE}-wal`, `${DATABASE_FILE}-shm`, DASHBOARD_PASSWORD_FILE, JSON_DATA_FILE]
     .forEach((filePath) => hardenPrivatePath(filePath, "file"));
 }
 
@@ -391,10 +394,45 @@ function validateUsageTimezone(timezone) {
 }
 
 /**
+ * Loads an operator-supplied dashboard password or creates a high-entropy local
+ * password on first launch. The generated secret is stored outside Git with
+ * owner-only permissions and can be rotated by deleting the file while FiberX
+ * is stopped. Concurrent first starts safely converge on the same file.
+ *
+ * @returns {string} Dashboard password used for HTTP Basic authentication.
+ */
+function getDashboardPassword() {
+  const configuredPassword = process.env.DASHBOARD_PASSWORD || "";
+  if (configuredPassword) {
+    return configuredPassword;
+  }
+
+  preparePrivateStorage();
+  if (!fs.existsSync(DASHBOARD_PASSWORD_FILE)) {
+    const generatedPassword = crypto.randomBytes(32).toString("base64url");
+    try {
+      fs.writeFileSync(DASHBOARD_PASSWORD_FILE, `${generatedPassword}\n`, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      });
+      console.log(`Dashboard password created at ${DASHBOARD_PASSWORD_FILE}.`);
+    } catch (error) {
+      if (!error || error.code !== "EEXIST") {
+        throw error;
+      }
+    }
+  }
+
+  hardenPrivatePath(DASHBOARD_PASSWORD_FILE, "file");
+  return fs.readFileSync(DASHBOARD_PASSWORD_FILE, "utf8").trim();
+}
+
+/**
  * Reads and validates runtime configuration while deliberately excluding the
  * router password from any object that is logged or returned to the browser.
  *
- * @returns {{port:number,host:string,routerUrl:URL,routerUsername:string,routerPassword:string,allowInsecureTls:boolean,usageTimezone:string,collectionIntervalMs:number}} Runtime configuration.
+ * @returns {{port:number,host:string,dashboardUsername:string,dashboardPassword:string,routerUrl:URL,routerUsername:string,routerPassword:string,allowInsecureTls:boolean,usageTimezone:string,collectionIntervalMs:number}} Runtime configuration.
  */
 function getConfig() {
   if (cachedConfig) {
@@ -404,6 +442,8 @@ function getConfig() {
   loadDotEnvFile(ENVIRONMENT_FILE);
   const routerUrl = parseRouterUrl(process.env.ROUTER_URL);
   const configuredPort = Number.parseInt(process.env.PORT || "3000", 10);
+  const dashboardUsername = process.env.DASHBOARD_USERNAME || "fiberx";
+  const dashboardPassword = getDashboardPassword();
   const routerUsername = process.env.ROUTER_USERNAME || "root";
   const routerPassword = process.env.ROUTER_PASSWORD || "";
   const usageTimezone = process.env.USAGE_TIMEZONE || "Africa/Lagos";
@@ -415,13 +455,24 @@ function getConfig() {
   if (!routerUsername || routerUsername.length > 256) {
     throw new Error("ROUTER_USERNAME must contain between 1 and 256 characters.");
   }
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(dashboardUsername)) {
+    throw new Error("DASHBOARD_USERNAME must contain 1-64 letters, numbers, dots, underscores, or hyphens.");
+  }
+  if (dashboardPassword.length < 20 || dashboardPassword.length > 256) {
+    throw new Error("DASHBOARD_PASSWORD must contain between 20 and 256 characters.");
+  }
   if (routerPassword.length > 1_024) {
     throw new Error("ROUTER_PASSWORD must not exceed 1024 characters.");
+  }
+  if (routerPassword && dashboardPassword === routerPassword) {
+    throw new Error("DASHBOARD_PASSWORD must not reuse ROUTER_PASSWORD.");
   }
 
   cachedConfig = {
     port: configuredPort,
     host: "127.0.0.1",
+    dashboardUsername,
+    dashboardPassword,
     routerUrl,
     routerUsername,
     routerPassword,
@@ -2289,12 +2340,14 @@ function readRequestBody(request) {
  *
  * @param {number} statusCode HTTP status code to expose.
  * @param {string} message Public error message.
- * @returns {Error & {statusCode:number,expose:boolean}} A controlled HTTP error.
+ * @param {Record<string,string>} headers Safe response headers such as an authentication challenge.
+ * @returns {Error & {statusCode:number,expose:boolean,headers:Record<string,string>}} A controlled HTTP error.
  */
-function createHttpError(statusCode, message) {
+function createHttpError(statusCode, message, headers = {}) {
   const error = new Error(message);
   error.statusCode = statusCode;
   error.expose = true;
+  error.headers = headers;
   return error;
 }
 
@@ -2336,14 +2389,16 @@ function getPublicRouterErrorMessage(error) {
  * @param {http.ServerResponse} response The outgoing response.
  * @param {number} statusCode HTTP status code.
  * @param {object} payload JSON-serializable payload.
+ * @param {Record<string,string>} headers Additional safe response headers.
  * @returns {void}
  */
-function sendJson(response, statusCode, payload) {
+function sendJson(response, statusCode, payload, headers = {}) {
   const serialized = JSON.stringify(payload);
   writeSecureHead(response, statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
     "Content-Length": Buffer.byteLength(serialized),
+    ...headers,
   });
   response.end(serialized);
 }
@@ -2390,6 +2445,51 @@ function validateLoopbackAuthority(request) {
   }
 
   return authority.origin;
+}
+
+/**
+ * Requires the dashboard's HTTP Basic credential using a constant-time digest
+ * comparison. Duplicate, oversized, malformed, and non-Basic Authorization
+ * headers all receive the same challenge without logging credential material.
+ *
+ * @param {http.IncomingMessage} request The incoming protected request.
+ * @returns {void}
+ */
+function requireDashboardAuthentication(request) {
+  const authorizationHeaderCount = request.rawHeaders.reduce((count, value, index) => (
+    index % 2 === 0 && value.toLowerCase() === "authorization" ? count + 1 : count
+  ), 0);
+  const authorization = request.headers.authorization;
+  const challenge = { "WWW-Authenticate": 'Basic realm="FiberX", charset="UTF-8"' };
+  if (authorizationHeaderCount !== 1
+    || typeof authorization !== "string"
+    || authorization.length > 1_024
+    || !authorization.startsWith("Basic ")) {
+    throw createHttpError(401, "Dashboard authentication is required.", challenge);
+  }
+
+  const encodedCredential = authorization.slice(6).trim();
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encodedCredential)) {
+    throw createHttpError(401, "Dashboard authentication is required.", challenge);
+  }
+  const decodedBuffer = Buffer.from(encodedCredential, "base64");
+  const canonicalBase64 = decodedBuffer.toString("base64").replace(/=+$/, "");
+  if (canonicalBase64 !== encodedCredential.replace(/=+$/, "")) {
+    throw createHttpError(401, "Dashboard authentication is required.", challenge);
+  }
+
+  const separator = decodedBuffer.indexOf(0x3a);
+  if (separator < 1) {
+    throw createHttpError(401, "Dashboard authentication is required.", challenge);
+  }
+  const suppliedUsername = decodedBuffer.subarray(0, separator).toString("utf8");
+  const suppliedPassword = decodedBuffer.subarray(separator + 1).toString("utf8");
+  const config = getConfig();
+  const suppliedDigest = crypto.createHash("sha256").update(`${suppliedUsername}\0${suppliedPassword}`).digest();
+  const expectedDigest = crypto.createHash("sha256").update(`${config.dashboardUsername}\0${config.dashboardPassword}`).digest();
+  if (!crypto.timingSafeEqual(suppliedDigest, expectedDigest)) {
+    throw createHttpError(401, "Dashboard authentication is required.", challenge);
+  }
 }
 
 /**
@@ -2536,6 +2636,16 @@ async function handleRequest(request, response) {
       throw createHttpError(400, "The request target is invalid.");
     }
     const requestUrl = new URL(rawUrl, "http://127.0.0.1");
+    if (request.method === "GET" && requestUrl.pathname === "/healthz") {
+      writeSecureHead(response, 204, {
+        "Cache-Control": "no-store",
+        "Content-Length": 0,
+      });
+      response.end();
+      return;
+    }
+
+    requireDashboardAuthentication(request);
     const isApiRequest = requestUrl.pathname.startsWith("/api/");
     if (isApiRequest) {
       validateApiBrowserBoundary(request, expectedOrigin);
@@ -2630,7 +2740,7 @@ async function handleRequest(request, response) {
     if (statusCode >= 500) {
       console.error("Request failed:", error);
     }
-    sendJson(response, statusCode, { error: message });
+    sendJson(response, statusCode, { error: message }, error?.headers || {});
   }
 }
 
