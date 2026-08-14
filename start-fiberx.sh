@@ -3,6 +3,7 @@
 # Exit on command errors, unset variables, and failures inside pipelines so a
 # partially installed LaunchAgent cannot be mistaken for a successful setup.
 set -euo pipefail
+umask 077
 
 APP_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_FILE="${APP_DIRECTORY}/server.js"
@@ -13,6 +14,9 @@ LAUNCH_AGENT_DIRECTORY="${HOME}/Library/LaunchAgents"
 LAUNCH_AGENT_FILE="${LAUNCH_AGENT_DIRECTORY}/${SERVICE_LABEL}.plist"
 LOG_DIRECTORY="${HOME}/Library/Logs/FiberX"
 FIBERX_AGENT_WAS_LOADED=0
+MINIMUM_NODE_MAJOR=24
+MINIMUM_NODE_MINOR=18
+MINIMUM_NODE_PATCH=1
 
 ##
 # Prints an error and stops setup without changing another process that may be
@@ -39,6 +43,34 @@ find_node_binary() {
   [[ -n "$discovered_node" ]] || die "Node.js was not found. Install Node.js 18+ and run this script again."
   [[ -x "$discovered_node" ]] || die "The Node.js path is not executable: ${discovered_node}"
   FIBERX_NODE_BINARY="$discovered_node"
+}
+
+##
+# Rejects end-of-life and pre-security-release Node.js runtimes before launchd
+# installs them as a persistent service. FiberX intentionally supports the
+# current 24.x LTS line, beginning with the July 2026 security release.
+#
+# @returns Nothing when the discovered Node.js version meets the baseline.
+##
+validate_node_version() {
+  local raw_version=""
+  local major=0
+  local minor=0
+  local patch=0
+
+  raw_version="$("$FIBERX_NODE_BINARY" --version)"
+  if [[ ! "$raw_version" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    die "Could not parse the Node.js version reported by ${FIBERX_NODE_BINARY}."
+  fi
+  major="${BASH_REMATCH[1]}"
+  minor="${BASH_REMATCH[2]}"
+  patch="${BASH_REMATCH[3]}"
+
+  if (( major != MINIMUM_NODE_MAJOR
+    || minor < MINIMUM_NODE_MINOR
+    || (minor == MINIMUM_NODE_MINOR && patch < MINIMUM_NODE_PATCH) )); then
+    die "Node.js ${MINIMUM_NODE_MAJOR}.${MINIMUM_NODE_MINOR}.${MINIMUM_NODE_PATCH}+ within the 24.x LTS line is required; found ${raw_version}."
+  fi
 }
 
 ##
@@ -86,6 +118,37 @@ validate_runtime() {
   command -v plutil >/dev/null 2>&1 || die "plutil is required to validate the generated LaunchAgent."
   command -v curl >/dev/null 2>&1 || die "curl is required for the local startup check."
   command -v lsof >/dev/null 2>&1 || die "lsof is required to check whether the dashboard port is already in use."
+}
+
+##
+# Restricts the credential file, telemetry directory, and existing data files
+# to the current OS user. Symbolic links are rejected so the launcher cannot be
+# tricked into changing or later exposing an unrelated filesystem target.
+#
+# @returns Nothing after sensitive local paths have been validated and secured.
+##
+secure_runtime_paths() {
+  local environment_file="${APP_DIRECTORY}/.env"
+  local data_directory="${APP_DIRECTORY}/data"
+  local data_file=""
+
+  if [[ -L "$environment_file" ]]; then
+    die ".env must be a regular file, not a symbolic link."
+  fi
+  if [[ -e "$environment_file" ]]; then
+    [[ -f "$environment_file" ]] || die ".env must be a regular file."
+    chmod 600 "$environment_file"
+  fi
+
+  if [[ -L "$data_directory" ]]; then
+    die "data must be a real directory, not a symbolic link."
+  fi
+  mkdir -p "$data_directory"
+  [[ -d "$data_directory" ]] || die "data must be a directory."
+  chmod 700 "$data_directory"
+  while IFS= read -r -d '' data_file; do
+    chmod 600 "$data_file"
+  done < <(find "$data_directory" -maxdepth 1 -type f -print0)
 }
 
 ##
@@ -138,9 +201,13 @@ install_launch_agent() {
   local escaped_app_directory=""
   local escaped_stdout=""
   local escaped_stderr=""
-  local temporary_file="${LAUNCH_AGENT_FILE}.tmp.$$"
+  local temporary_file=""
 
   mkdir -p "$LAUNCH_AGENT_DIRECTORY" "$LOG_DIRECTORY"
+  chmod 700 "$LOG_DIRECTORY"
+  touch "${LOG_DIRECTORY}/server.log" "${LOG_DIRECTORY}/server-error.log"
+  chmod 600 "${LOG_DIRECTORY}/server.log" "${LOG_DIRECTORY}/server-error.log"
+  temporary_file="$(mktemp "${LAUNCH_AGENT_DIRECTORY}/.${SERVICE_LABEL}.XXXXXX")"
   escaped_node="$(xml_escape "$FIBERX_NODE_BINARY")"
   escaped_server="$(xml_escape "$SERVER_FILE")"
   escaped_app_directory="$(xml_escape "$APP_DIRECTORY")"
@@ -157,7 +224,6 @@ install_launch_agent() {
   <key>ProgramArguments</key>
   <array>
     <string>${escaped_node}</string>
-    <string>--no-warnings</string>
     <string>${escaped_server}</string>
   </array>
   <key>WorkingDirectory</key>
@@ -183,7 +249,7 @@ EOF
     die "The generated LaunchAgent plist failed validation."
   }
   mv -f "$temporary_file" "$LAUNCH_AGENT_FILE"
-  chmod 644 "$LAUNCH_AGENT_FILE"
+  chmod 600 "$LAUNCH_AGENT_FILE"
 }
 
 ##
@@ -248,8 +314,10 @@ report_startup() {
 ##
 main() {
   find_node_binary
+  validate_node_version
   read_dashboard_port
   validate_runtime
+  secure_runtime_paths
   unload_existing_agent
   wait_for_previous_agent_exit
   assert_dashboard_port_available

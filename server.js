@@ -36,6 +36,7 @@ const ALLOWED_DOT_ENV_KEYS = new Set([
 ]);
 const STORE_VERSION = 4;
 const DATABASE_SCHEMA_VERSION = 1;
+const MINIMUM_NODE_VERSION = Object.freeze([24, 18, 1]);
 const MAX_COUNTER_DIGITS = 128;
 const MAX_DEVICE_FIELD_LENGTH = 512;
 const MAX_DEVICE_RECORDS = 512;
@@ -136,6 +137,25 @@ let sqliteDatabase = null;
 let storageBackend = null;
 let backgroundCollectionTimer = null;
 let lastBackgroundCollectionError = null;
+
+/**
+ * Compares the running Node.js release with the security baseline documented by
+ * this repository. FiberX supports the current 24.x LTS line only so an EOL or
+ * pre-security-release runtime cannot silently host the local HTTP service.
+ *
+ * @returns {void}
+ */
+function assertSupportedNodeRuntime() {
+  const versionParts = process.versions.node.split(".").map((part) => Number.parseInt(part, 10));
+  const [requiredMajor, requiredMinor, requiredPatch] = MINIMUM_NODE_VERSION;
+  const [major, minor, patchVersion] = versionParts;
+  const meetsMinimum = major === requiredMajor && (
+    minor > requiredMinor || (minor === requiredMinor && patchVersion >= requiredPatch)
+  );
+  if (!meetsMinimum) {
+    throw new Error(`FiberX requires a patched Node.js 24 LTS release (v${MINIMUM_NODE_VERSION.join(".")} or newer within 24.x). Running: v${process.versions.node}.`);
+  }
+}
 
 /**
  * Creates a distinguishable error for a local path that could redirect
@@ -2688,4 +2708,5 @@ function startServer() {
   return server;
 }
 
+assertSupportedNodeRuntime();
 startServer();

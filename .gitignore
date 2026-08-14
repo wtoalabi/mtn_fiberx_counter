@@ -2,5 +2,6 @@
 .env
 data/*.json
 data/*.sqlite*
+data/.usage-*.tmp
 node_modules/
 npm-debug.log*

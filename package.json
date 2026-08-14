@@ -1,0 +1,13 @@
+{
+  "name": "fiberx-data-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A dependency-free local dashboard for MTN FiberX router usage counters.",
+  "engines": {
+    "node": ">=24.18.1 <25"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check app.js"
+  }
+}

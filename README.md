@@ -19,7 +19,7 @@ The dashboard also checks the Huawei connected-client resources and displays the
 
 ## Run it
 
-Use Node.js 18 or newer. Node.js 22.5 or newer uses the built-in `node:sqlite` API; older supported runtimes automatically use JSON. No package installation is required.
+Use the latest patched Node.js 24 LTS release. The enforced minimum is Node.js 24.18.1, which includes the July 2026 security fixes; `.nvmrc` selects the newest available 24.x patch through common version managers. FiberX uses the built-in `node:sqlite` API and retains JSON as a recovery fallback. No package installation is required.
 
 1. Change the router's default password in the Huawei web UI first.
 2. Copy `.env.example` to `.env`, restrict it to your OS account with `chmod 600 .env`, and set `ROUTER_PASSWORD` to the new password. You can export the variables in your shell instead if you do not want a credential file.
@@ -44,19 +44,19 @@ Closing the browser does not stop collection as long as `node server.js` remains
 Use the included one-command launcher. It discovers the Node.js path, generates the LaunchAgent for this checkout, installs it, starts `server.js` through launchd, and verifies the local dashboard:
 
 ```sh
-/Users/mac/dev/web/fiberx/start-fiberx.sh
+./start-fiberx.sh
 ```
 
 If macOS says the script is not executable, run this once and then run the launcher:
 
 ```sh
-chmod +x /Users/mac/dev/web/fiberx/start-fiberx.sh
-/Users/mac/dev/web/fiberx/start-fiberx.sh
+chmod +x ./start-fiberx.sh
+./start-fiberx.sh
 ```
 
 The generated plist is stored at `~/Library/LaunchAgents/com.mtn.fiberx.tracker.plist`. The script is safe to run again after moving Node or changing the project path; it refreshes the plist and restarts the same service. Logs go to `~/Library/Logs/FiberX/server.log` and `~/Library/Logs/FiberX/server-error.log`.
 
-Do not leave a manually started `node server.js` running when you run the launcher. If port 4000 (or the `PORT` value in `.env`) is already occupied, the script stops and tells you which process must be stopped; it never kills an existing process automatically.
+Do not leave a manually started `node server.js` running when you run the launcher. If the configured dashboard port is already occupied, the script stops and tells you which process must be stopped; it never kills an existing process automatically.
 
 If the dashboard reports that the router reset the connection, stop the server, wait for the Huawei login lockout timer to clear, verify that `ROUTER_PASSWORD` in `.env` matches the current router password, and start the server again. The collector pauses repeated login attempts after a failure so a wrong password does not continuously lock the router.
 
