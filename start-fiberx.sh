@@ -26,19 +26,18 @@ die() {
 }
 
 ##
-# Finds the absolute Node.js executable used to launch the service and verifies
-# that it includes the built-in SQLite API. launchd does not load interactive
-# shell startup files, so the plist must contain an absolute executable path
-# rather than relying on the user's PATH.
+# Finds the absolute Node.js executable used to launch the service. launchd does
+# not load interactive shell startup files, so the plist must contain an
+# absolute executable path rather than relying on the user's PATH. The server
+# selects SQLite or JSON at runtime based on the available Node.js APIs.
 #
 # @returns The absolute Node.js executable path through the global variable.
 ##
 find_node_binary() {
   local discovered_node=""
   discovered_node="$(command -v node || true)"
-  [[ -n "$discovered_node" ]] || die "Node.js was not found. Install Node.js 22.5+ and run this script again."
+  [[ -n "$discovered_node" ]] || die "Node.js was not found. Install Node.js 18+ and run this script again."
   [[ -x "$discovered_node" ]] || die "The Node.js path is not executable: ${discovered_node}"
-  "$discovered_node" --no-warnings -e "require('node:sqlite')" >/dev/null 2>&1 || die "Node.js 22.5+ with built-in node:sqlite is required. Upgrade Node.js, then run this script again."
   FIBERX_NODE_BINARY="$discovered_node"
 }
 

@@ -17,7 +17,7 @@ try {
 const ROOT_DIRECTORY = __dirname;
 const DATA_DIRECTORY = path.join(ROOT_DIRECTORY, "data");
 const DATABASE_FILE = path.join(DATA_DIRECTORY, "fiberx.sqlite");
-const LEGACY_DATA_FILE = path.join(DATA_DIRECTORY, "usage.json");
+const JSON_DATA_FILE = path.join(DATA_DIRECTORY, "usage.json");
 const STORE_VERSION = 4;
 const DATABASE_SCHEMA_VERSION = 1;
 const WAN_STATS_ENDPOINTS = [
@@ -86,6 +86,7 @@ let cachedConfig = null;
 let collectionPromise = null;
 let persistenceQueue = Promise.resolve();
 let sqliteDatabase = null;
+let storageBackend = null;
 let backgroundCollectionTimer = null;
 let lastBackgroundCollectionError = null;
 
@@ -208,32 +209,107 @@ function normalizeStore(candidate) {
 }
 
 /**
- * Reads the normalized application state from SQLite, importing the legacy JSON
- * file once when this is the first database open. The database directory is
- * created lazily so a clean checkout stays free of generated files until the
- * app is used.
+ * Reads the normalized application state from the selected persistence backend.
+ * SQLite is preferred when the running Node.js process provides node:sqlite;
+ * otherwise the existing JSON store remains the active backend.
  *
- * @returns {Promise<object>} The normalized SQLite-backed usage store.
+ * @returns {Promise<object>} The normalized usage store.
  */
 async function readUsageStore() {
+  if (getStorageBackend() === "json") {
+    return readStoreFromJson();
+  }
+
   return readStoreFromDatabase(getDatabase());
 }
 
 /**
- * Serializes SQLite writes through a single promise queue. This prevents a
- * manual dashboard sync from interleaving with the background collection and
- * keeps the state row and newly collected samples in one transaction.
+ * Serializes persistence writes through a single promise queue. This prevents a
+ * manual dashboard sync from interleaving with the background collection while
+ * using either the transactional SQLite backend or the atomic JSON fallback.
  *
  * @param {object} store The store to persist.
- * @param {{sample?:object|null,deviceUsageSamples?:object[],replaceHistory?:boolean}} options Incremental or migration write options.
+ * @param {{sample?:object|null,deviceUsageSamples?:object[],replaceHistory?:boolean}} options Incremental or migration write options. JSON persistence ignores the SQLite-only options because the complete store is written.
  * @returns {Promise<void>} Resolves after the queued write completes.
  */
 function persistUsageStore(store, options = {}) {
-  persistenceQueue = persistenceQueue.then(() => {
+  persistenceQueue = persistenceQueue.then(async () => {
+    if (getStorageBackend() === "json") {
+      await writeStoreToJson(store);
+      return;
+    }
+
     writeStoreToDatabase(getDatabase(), store, options);
   });
 
   return persistenceQueue;
+}
+
+/**
+ * Selects SQLite when its built-in Node.js API is available and falls back to
+ * the JSON persistence file when it is not. A database initialization failure
+ * is treated as unavailable storage so an older or restricted runtime can
+ * still start the dashboard with the recoverable JSON history.
+ *
+ * @returns {"sqlite"|"json"} The backend used for this process.
+ */
+function getStorageBackend() {
+  if (storageBackend) {
+    return storageBackend;
+  }
+
+  if (!DatabaseSync) {
+    storageBackend = "json";
+    console.warn("FiberX storage: node:sqlite is unavailable; using data/usage.json.");
+    return storageBackend;
+  }
+
+  try {
+    getDatabase();
+    storageBackend = "sqlite";
+  } catch (error) {
+    storageBackend = "json";
+    const reason = error instanceof Error ? error.message : "SQLite initialization failed.";
+    console.warn(`FiberX storage: SQLite is unavailable (${reason}); using ${JSON_DATA_FILE}.`);
+  }
+
+  return storageBackend;
+}
+
+/**
+ * Reads and normalizes the JSON fallback store. A missing file represents a
+ * clean first launch, while malformed or unreadable JSON is surfaced so the
+ * user does not lose visibility into a damaged local history file.
+ *
+ * @returns {Promise<object>} The normalized JSON-backed usage store.
+ */
+async function readStoreFromJson() {
+  try {
+    const contents = await fsPromises.readFile(JSON_DATA_FILE, "utf8");
+    return normalizeStore(JSON.parse(contents));
+  } catch (error) {
+    if (error && error.code !== "ENOENT") {
+      throw error;
+    }
+    return createEmptyStore();
+  }
+}
+
+/**
+ * Atomically writes the complete JSON fallback store so older Node.js versions
+ * can continue collecting data when the built-in SQLite API is unavailable.
+ * The existing promise queue prevents concurrent writes from replacing one
+ * another out of order.
+ *
+ * @param {object} store The normalized store to persist.
+ * @returns {Promise<void>} Resolves after the JSON file has been replaced.
+ */
+async function writeStoreToJson(store) {
+  await fsPromises.mkdir(DATA_DIRECTORY, { recursive: true });
+  const serialized = `${JSON.stringify(store, null, 2)}\n`;
+  const temporaryFile = `${JSON_DATA_FILE}.tmp`;
+  await fsPromises.writeFile(temporaryFile, serialized, "utf8");
+  await fsPromises.rename(temporaryFile, JSON_DATA_FILE);
 }
 
 /**
@@ -466,8 +542,8 @@ function migrateLegacyJson(database) {
   }
 
   let legacyStore = null;
-  if (fs.existsSync(LEGACY_DATA_FILE)) {
-    const contents = fs.readFileSync(LEGACY_DATA_FILE, "utf8");
+  if (fs.existsSync(JSON_DATA_FILE)) {
+    const contents = fs.readFileSync(JSON_DATA_FILE, "utf8");
     legacyStore = normalizeStore(JSON.parse(contents));
   }
 
