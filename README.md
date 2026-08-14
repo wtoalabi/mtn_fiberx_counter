@@ -25,7 +25,7 @@ This project was inspired by [sagenoya/mtn-data-tracker](https://github.com/sage
 
 - Node.js `24.18.1` or newer within the Node 24 LTS line.
 - A Huawei router with the WAN statistics endpoints used by MTN FiberX. The project is tested with the HG8145X7-10.
-- macOS only if you want to use the included background launcher.
+- macOS 12 or newer if you want to use the included background launcher or menu-bar companion.
 
 FiberX uses Node's built-in APIs. There is no `npm install` step.
 
@@ -67,9 +67,18 @@ The included launcher installs a per-user LaunchAgent and keeps the collector ru
 
 The launcher checks the Node.js version and configuration, starts the service at login, and verifies the local dashboard. Logs are written to `~/Library/Logs/FiberX/`.
 
-## Add a macOS menu-bar icon
+## Add the macOS menu-bar companion
 
-The optional menu-bar companion gives you a FiberX icon in the macOS menu bar. Clicking it opens a compact dropdown with total usage this month, today's usage, recent download/upload speed, daily average, projected month-end usage, plan status, router status, and last sync time. The full dashboard is still available as an optional menu action, but it is not needed for routine checks.
+The optional menu-bar companion puts a FiberX chart icon in the macOS menu bar (the Mac equivalent of a system tray). It uses the existing local collector and does not start a second router-collection process. Clicking the icon opens a native dropdown with:
+
+- collector and router status;
+- total usage this month and today's usage;
+- recent download/upload speed;
+- daily average and projected month-end usage;
+- plan status and the last successful sync time; and
+- refresh, optional dashboard, service restart, and log-opening actions.
+
+The companion authenticates to the local dashboard API with `DASHBOARD_PASSWORD` from the same `.env` file. It keeps its session in memory and does not require a second password or a cloud account.
 
 Install the background collector first, then build and install the companion:
 
@@ -78,7 +87,11 @@ Install the background collector first, then build and install the companion:
 ./macos/install-menubar-app.sh
 ```
 
-This uses the Swift compiler and AppKit already provided by macOS. It does not require the paid Apple Developer Program. The installer ad-hoc signs the app for use on the Mac where it was built; it is not notarized and is not intended for App Store distribution. If macOS shows a verification warning the first time, control-click `~/Applications/FiberX.app`, choose **Open**, and confirm.
+The installer builds the app locally with Swift and AppKit, installs it at `~/Applications/FiberX.app`, and starts it through a separate per-user LaunchAgent at login. If you change `PORT` in `.env`, run the installer again so the menu-bar app uses the new dashboard port.
+
+The installer uses the Swift compiler and AppKit provided by macOS. If `swiftc` is unavailable, install Apple's Command Line Tools and run the installer again. A paid Apple Developer Program membership is not required. The app is ad-hoc signed for the Mac where it was built; it is not notarized and is not intended for App Store distribution. If macOS shows a verification warning the first time, control-click `~/Applications/FiberX.app`, choose **Open**, and confirm.
+
+If the menu shows **Not running**, start or repair the collector with `./start-fiberx.sh`. The menu-bar companion can be quit or removed independently; removing it does not remove the collector, `.env`, local history, or logs.
 
 To remove only the menu-bar companion:
 
