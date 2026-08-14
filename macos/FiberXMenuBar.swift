@@ -62,6 +62,19 @@ private struct FiberXSettings: Decodable {
     let capGb: Double?
 }
 
+/// Returns a readable MTN-yellow accent for either macOS appearance. The dark
+/// appearance uses the familiar bright yellow, while the light appearance uses
+/// a deeper gold so yellow text remains legible against a pale menu surface.
+///
+/// - Returns: The current-appearance FiberX accent color.
+private func fiberXAccentColor() -> NSColor {
+    let isDarkAppearance = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    if isDarkAppearance {
+        return NSColor(calibratedRed: 1.0, green: 0.8, blue: 0.0, alpha: 1.0)
+    }
+    return NSColor(calibratedRed: 0.62, green: 0.42, blue: 0.0, alpha: 1.0)
+}
+
 /// Renders one high-contrast label/value row inside the native status-item
 /// menu. Custom views avoid the muted appearance macOS applies to disabled
 /// informational menu items while preserving the system menu background.
@@ -118,7 +131,7 @@ private final class FiberXMenuRowView: NSView {
         labelField.lineBreakMode = .byTruncatingTail
 
         valueField.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
-        valueField.textColor = NSColor.labelColor
+        valueField.textColor = fiberXAccentColor()
         valueField.alignment = .right
         valueField.lineBreakMode = .byTruncatingHead
 
@@ -254,7 +267,10 @@ final class FiberXMenuBarController: NSObject, NSApplicationDelegate, NSMenuDele
         let headerItem = makeMenuHeaderItem(in: fiberXMenu)
         headerItem.attributedTitle = NSAttributedString(
             string: "FiberX",
-            attributes: [.font: NSFont.boldSystemFont(ofSize: 14)]
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 16, weight: .bold),
+                .foregroundColor: fiberXAccentColor(),
+            ]
         )
 
         serviceStatusRow = makeMetricRow(label: "Service", value: "Checking…", in: fiberXMenu)
@@ -484,16 +500,16 @@ final class FiberXMenuBarController: NSObject, NSApplicationDelegate, NSMenuDele
     ///
     /// - Parameter summary: The current-month usage summary returned by FiberX.
     private func renderSummary(_ summary: FiberXSummary) {
-        totalUsageRow?.update(value: formatBytes(summary.totalUsageBytes), color: NSColor.controlAccentColor)
-        todayUsageRow?.update(value: formatBytes(summary.todayUsageBytes), color: NSColor.controlAccentColor)
-        averageRow?.update(value: "\(formatBytes(summary.dailyAverageBytes))/day")
-        projectedRow?.update(value: formatBytes(summary.projectedMonthEndBytes))
+        totalUsageRow?.update(value: formatBytes(summary.totalUsageBytes), color: fiberXAccentColor())
+        todayUsageRow?.update(value: formatBytes(summary.todayUsageBytes), color: fiberXAccentColor())
+        averageRow?.update(value: "\(formatBytes(summary.dailyAverageBytes))/day", color: fiberXAccentColor())
+        projectedRow?.update(value: formatBytes(summary.projectedMonthEndBytes), color: fiberXAccentColor())
         lastSyncRow?.update(value: formatTimestamp(summary.lastSyncAt), color: NSColor.secondaryLabelColor)
 
         if let speed = summary.speed, speed.available {
             speedRow?.update(
                 value: "↓ \(formatRate(speed.rxBytesPerSecond))  ↑ \(formatRate(speed.txBytesPerSecond))",
-                color: NSColor.controlAccentColor
+                color: fiberXAccentColor()
             )
         } else {
             speedRow?.update(value: "Waiting for another sample", color: NSColor.secondaryLabelColor)
@@ -501,9 +517,9 @@ final class FiberXMenuBarController: NSObject, NSApplicationDelegate, NSMenuDele
 
         if let settings = summary.settings, settings.planMode == "capped" {
             let cap = settings.capGb.map { String(format: "%.0f GB cap", $0) } ?? "cap configured"
-            planRow?.update(value: "Capped (\(cap))")
+            planRow?.update(value: "Capped (\(cap))", color: fiberXAccentColor())
         } else {
-            planRow?.update(value: "Unlimited")
+            planRow?.update(value: "Unlimited", color: fiberXAccentColor())
         }
 
         routerStatusRow?.update(
