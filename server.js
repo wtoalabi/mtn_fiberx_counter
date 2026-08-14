@@ -39,11 +39,12 @@ const ALLOWED_DOT_ENV_KEYS = new Set([
   "ROUTER_USERNAME",
   "USAGE_TIMEZONE",
 ]);
-const STORE_VERSION = 4;
-const DATABASE_SCHEMA_VERSION = 1;
+const STORE_VERSION = 5;
+const DATABASE_SCHEMA_VERSION = 2;
 const MINIMUM_NODE_VERSION = Object.freeze([24, 18, 1]);
 const MAX_COUNTER_DIGITS = 128;
-const MAX_DEVICE_FIELD_LENGTH = 512;
+const MAX_DEVICE_FIELD_LENGTH = 128;
+const MAX_DEVICE_IDENTITIES_PER_MONTH = 2_048;
 const MAX_DEVICE_RECORDS = 512;
 const MAX_JSON_NODES = 10_000;
 const MAX_REQUEST_BODY_BYTES = 16_384;
@@ -567,9 +568,162 @@ function normalizeStore(candidate) {
     lastRouter: source.lastRouter && typeof source.lastRouter === "object" ? source.lastRouter : null,
     lastDevices: source.lastDevices && typeof source.lastDevices === "object" ? source.lastDevices : null,
     lastOfflineGap: source.lastOfflineGap && typeof source.lastOfflineGap === "object" ? source.lastOfflineGap : null,
-    deviceUsageSamples: Array.isArray(source.deviceUsageSamples) ? source.deviceUsageSamples : [],
-    samples: Array.isArray(source.samples) ? source.samples : [],
+    deviceUsageSamples: compactDeviceUsageSamples(Array.isArray(source.deviceUsageSamples) ? source.deviceUsageSamples : []),
+    samples: compactUsageSamples(Array.isArray(source.samples) ? source.samples : []),
   };
+}
+
+/**
+ * Normalizes a persisted non-negative count without allowing malformed or
+ * excessively large numeric values to poison summary arithmetic.
+ *
+ * @param {unknown} value Persisted count value.
+ * @param {number} fallback Value used when the input is invalid.
+ * @returns {number} A bounded non-negative integer.
+ */
+function normalizePersistedCount(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+/**
+ * Compacts interval-level WAN rows into one exact daily aggregate. Latest
+ * cumulative counters are retained, interval deltas are summed with BigInt,
+ * and poll counts remain available for CSV diagnostics.
+ *
+ * @param {object[]} samples Persisted WAN interval or aggregate rows.
+ * @returns {object[]} Chronological daily WAN aggregates.
+ */
+function compactUsageSamples(samples) {
+  const dailySamples = new Map();
+  samples.forEach((sample) => {
+    const day = String(sample?.day || "");
+    const capturedAt = String(sample?.capturedAt || "");
+    if (!/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/.test(day)
+      || !Number.isFinite(Date.parse(capturedAt))) {
+      return;
+    }
+
+    const existing = dailySamples.get(day);
+    const pollCount = Math.max(1, normalizePersistedCount(sample.pollCount, 1));
+    const routerRecordCount = normalizePersistedCount(sample.sampleCount, 0);
+    if (!existing) {
+      dailySamples.set(day, {
+        capturedAt,
+        day,
+        month: day.slice(0, 7),
+        rxBytes: normalizeCounter(sample.rxBytes),
+        txBytes: normalizeCounter(sample.txBytes),
+        rxDeltaBytes: normalizeCounter(sample.rxDeltaBytes),
+        txDeltaBytes: normalizeCounter(sample.txDeltaBytes),
+        usageBytes: normalizeCounter(sample.usageBytes),
+        counterReset: Boolean(sample.counterReset),
+        offlineGap: sample.offlineGap && typeof sample.offlineGap === "object" ? sample.offlineGap : null,
+        sampleCount: routerRecordCount,
+        pollCount,
+      });
+      return;
+    }
+
+    existing.rxDeltaBytes = addCounterStrings(existing.rxDeltaBytes, sample.rxDeltaBytes);
+    existing.txDeltaBytes = addCounterStrings(existing.txDeltaBytes, sample.txDeltaBytes);
+    existing.usageBytes = addCounterStrings(existing.usageBytes, sample.usageBytes);
+    existing.counterReset = existing.counterReset || Boolean(sample.counterReset);
+    existing.sampleCount = Math.min(Number.MAX_SAFE_INTEGER, existing.sampleCount + routerRecordCount);
+    existing.pollCount = Math.min(Number.MAX_SAFE_INTEGER, existing.pollCount + pollCount);
+    if (capturedAt >= existing.capturedAt) {
+      existing.capturedAt = capturedAt;
+      existing.rxBytes = normalizeCounter(sample.rxBytes);
+      existing.txBytes = normalizeCounter(sample.txBytes);
+      existing.offlineGap = sample.offlineGap && typeof sample.offlineGap === "object"
+        ? sample.offlineGap
+        : existing.offlineGap;
+    }
+  });
+
+  return Array.from(dailySamples.values()).sort((first, second) => first.day.localeCompare(second.day));
+}
+
+/**
+ * Compacts interval-level device rows into one exact monthly row per stable
+ * device identity. A hard identity ceiling prevents a compromised router from
+ * exhausting local storage by rotating fabricated identifiers on every poll.
+ * When the ceiling is reached, established devices with the most observations
+ * win deterministically. WAN totals remain exact and independent of this cap.
+ *
+ * @param {object[]} samples Persisted device interval or aggregate rows.
+ * @returns {object[]} Chronological per-device monthly aggregates.
+ */
+function compactDeviceUsageSamples(samples) {
+  const monthlySamples = new Map();
+  samples.forEach((sample) => {
+    const day = String(sample?.day || "");
+    const capturedAt = String(sample?.capturedAt || "");
+    const deviceId = String(sample?.deviceId || "").slice(0, MAX_DEVICE_FIELD_LENGTH);
+    if (!deviceId
+      || !/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/.test(day)
+      || !Number.isFinite(Date.parse(capturedAt))) {
+      return;
+    }
+
+    const month = day.slice(0, 7);
+    const key = `${month}\0${deviceId}`;
+    const existing = monthlySamples.get(key);
+    const pollCount = Math.max(1, normalizePersistedCount(sample.pollCount, 1));
+    if (!existing) {
+      monthlySamples.set(key, {
+        capturedAt,
+        day,
+        month,
+        deviceId,
+        name: sample.name ? String(sample.name).slice(0, MAX_DEVICE_FIELD_LENGTH) : null,
+        mac: sample.mac ? String(sample.mac).slice(0, MAX_DEVICE_FIELD_LENGTH) : null,
+        ip: sample.ip ? String(sample.ip).slice(0, MAX_DEVICE_FIELD_LENGTH) : null,
+        rxDeltaBytes: normalizeCounter(sample.rxDeltaBytes),
+        txDeltaBytes: normalizeCounter(sample.txDeltaBytes),
+        usageBytes: normalizeCounter(sample.usageBytes),
+        counterReset: Boolean(sample.counterReset),
+        baseline: Boolean(sample.baseline),
+        pollCount,
+      });
+      return;
+    }
+
+    existing.rxDeltaBytes = addCounterStrings(existing.rxDeltaBytes, sample.rxDeltaBytes);
+    existing.txDeltaBytes = addCounterStrings(existing.txDeltaBytes, sample.txDeltaBytes);
+    existing.usageBytes = addCounterStrings(existing.usageBytes, sample.usageBytes);
+    existing.counterReset = existing.counterReset || Boolean(sample.counterReset);
+    existing.baseline = existing.baseline && Boolean(sample.baseline);
+    existing.pollCount = Math.min(Number.MAX_SAFE_INTEGER, existing.pollCount + pollCount);
+    if (capturedAt >= existing.capturedAt) {
+      existing.capturedAt = capturedAt;
+      existing.day = day;
+      existing.name = sample.name ? String(sample.name).slice(0, MAX_DEVICE_FIELD_LENGTH) : existing.name;
+      existing.mac = sample.mac ? String(sample.mac).slice(0, MAX_DEVICE_FIELD_LENGTH) : existing.mac;
+      existing.ip = sample.ip ? String(sample.ip).slice(0, MAX_DEVICE_FIELD_LENGTH) : existing.ip;
+    }
+  });
+
+  const samplesByMonth = new Map();
+  monthlySamples.forEach((sample) => {
+    const monthSamples = samplesByMonth.get(sample.month) || [];
+    monthSamples.push(sample);
+    samplesByMonth.set(sample.month, monthSamples);
+  });
+
+  const boundedSamples = [];
+  samplesByMonth.forEach((monthSamples) => {
+    monthSamples.sort((first, second) => (
+      second.pollCount - first.pollCount
+      || second.capturedAt.localeCompare(first.capturedAt)
+      || first.deviceId.localeCompare(second.deviceId)
+    ));
+    boundedSamples.push(...monthSamples.slice(0, MAX_DEVICE_IDENTITIES_PER_MONTH));
+  });
+
+  return boundedSamples.sort((first, second) => (
+    first.month.localeCompare(second.month) || first.deviceId.localeCompare(second.deviceId)
+  ));
 }
 
 /**
@@ -593,11 +747,11 @@ async function readUsageStore() {
  * using either the transactional SQLite backend or the atomic JSON fallback.
  *
  * @param {object} store The store to persist.
- * @param {{sample?:object|null,deviceUsageSamples?:object[],replaceHistory?:boolean}} options Incremental or migration write options. JSON persistence ignores the SQLite-only options because the complete store is written.
+ * @param {{sample?:object|null,deviceUsageSamples?:object[],deletedDeviceUsageSamples?:object[],replaceHistory?:boolean}} options Incremental or migration write options. JSON persistence ignores the SQLite-only options because the complete store is written.
  * @returns {Promise<void>} Resolves after the queued write completes.
  */
 function persistUsageStore(store, options = {}) {
-  persistenceQueue = persistenceQueue.then(async () => {
+  const operation = persistenceQueue.then(async () => {
     if (getStorageBackend() === "json") {
       await writeStoreToJson(store);
       return;
@@ -606,14 +760,17 @@ function persistUsageStore(store, options = {}) {
     writeStoreToDatabase(getDatabase(), store, options);
   });
 
-  return persistenceQueue;
+  persistenceQueue = operation.catch(() => {
+    // Keep later writes usable while the caller receives this operation's error.
+  });
+  return operation;
 }
 
 /**
  * Selects SQLite when its built-in Node.js API is available and falls back to
- * the JSON persistence file when it is not. A database initialization failure
- * is treated as unavailable storage so an older or restricted runtime can
- * still start the dashboard with the recoverable JSON history.
+ * the JSON persistence file only when the API itself is unavailable. Database
+ * initialization and migration errors fail closed so corruption or a newer
+ * schema cannot silently split future samples into another backend.
  *
  * @returns {"sqlite"|"json"} The backend used for this process.
  */
@@ -628,17 +785,8 @@ function getStorageBackend() {
     return storageBackend;
   }
 
-  try {
-    getDatabase();
-    storageBackend = "sqlite";
-  } catch (error) {
-    if (error && error.code === "ERR_FIBERX_UNSAFE_PATH") {
-      throw error;
-    }
-    storageBackend = "json";
-    const reason = error instanceof Error ? error.message : "SQLite initialization failed.";
-    console.warn(`FiberX storage: SQLite is unavailable (${reason}); using ${JSON_DATA_FILE}.`);
-  }
+  getDatabase();
+  storageBackend = "sqlite";
 
   return storageBackend;
 }
@@ -664,7 +812,7 @@ async function readStoreFromJson() {
 }
 
 /**
- * Atomically writes the complete JSON fallback store so older Node.js versions
+ * Atomically writes the complete JSON fallback store so a restricted runtime
  * can continue collecting data when the built-in SQLite API is unavailable.
  * The existing promise queue prevents concurrent writes from replacing one
  * another out of order.
@@ -752,7 +900,9 @@ function getDatabase() {
         usage_bytes TEXT NOT NULL,
         counter_reset INTEGER NOT NULL,
         offline_gap_json TEXT,
-        sample_count INTEGER NOT NULL
+        sample_count INTEGER NOT NULL,
+        poll_count INTEGER NOT NULL,
+        UNIQUE (day)
       );
 
       CREATE INDEX IF NOT EXISTS usage_samples_month_idx
@@ -772,7 +922,9 @@ function getDatabase() {
         usage_bytes TEXT NOT NULL,
         counter_reset INTEGER NOT NULL,
         baseline INTEGER NOT NULL,
-        UNIQUE (captured_at, device_id)
+        poll_count INTEGER NOT NULL,
+        UNIQUE (captured_at, device_id),
+        UNIQUE (month, device_id)
       );
 
       CREATE INDEX IF NOT EXISTS device_usage_samples_month_idx
@@ -793,12 +945,83 @@ function getDatabase() {
       VALUES ('database_schema_version', ?)
     `).run(String(DATABASE_SCHEMA_VERSION));
 
+    migrateDatabaseSchema(database);
     migrateLegacyJson(database);
     preparePrivateStorage();
     sqliteDatabase = database;
     return sqliteDatabase;
   } catch (error) {
     database.close();
+    throw error;
+  }
+}
+
+/**
+ * Upgrades an existing database in place before any normal reads or writes.
+ * Version 2 compacts historical WAN intervals by day and device intervals by
+ * month, preserving exact byte totals while preventing unbounded 30-second-row
+ * growth. The entire rewrite is transactional so an interrupted launch leaves
+ * the previous schema and history recoverable.
+ *
+ * @param {object} database The initialized SQLite database connection.
+ * @returns {void}
+ */
+function migrateDatabaseSchema(database) {
+  const metadata = database.prepare(`
+    SELECT value FROM metadata WHERE key = 'database_schema_version'
+  `).get();
+  const parsedVersion = Number.parseInt(metadata?.value || "0", 10);
+  const schemaVersion = Number.isSafeInteger(parsedVersion) && parsedVersion >= 0 ? parsedVersion : 0;
+  if (schemaVersion > DATABASE_SCHEMA_VERSION) {
+    throw new Error(`Database schema ${schemaVersion} is newer than this FiberX release supports.`);
+  }
+
+  const usageColumns = new Set(database.prepare("PRAGMA table_info(usage_samples)").all().map((column) => column.name));
+  const deviceColumns = new Set(database.prepare("PRAGMA table_info(device_usage_samples)").all().map((column) => column.name));
+  const usageIndexes = new Set(database.prepare("PRAGMA index_list(usage_samples)").all().map((index) => index.name));
+  const deviceIndexes = new Set(database.prepare("PRAGMA index_list(device_usage_samples)").all().map((index) => index.name));
+  const requiresUpgrade = schemaVersion < DATABASE_SCHEMA_VERSION
+    || !usageColumns.has("poll_count")
+    || !deviceColumns.has("poll_count")
+    || !usageIndexes.has("usage_samples_day_unique_idx")
+    || !deviceIndexes.has("device_usage_samples_month_device_unique_idx");
+  if (!requiresUpgrade) {
+    return;
+  }
+
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    if (!usageColumns.has("poll_count")) {
+      database.exec("ALTER TABLE usage_samples ADD COLUMN poll_count INTEGER NOT NULL DEFAULT 1;");
+    }
+    if (!deviceColumns.has("poll_count")) {
+      database.exec("ALTER TABLE device_usage_samples ADD COLUMN poll_count INTEGER NOT NULL DEFAULT 1;");
+    }
+
+    const compactedStore = readStoreFromDatabase(database);
+    database.exec("DELETE FROM usage_samples; DELETE FROM device_usage_samples;");
+    database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS usage_samples_day_unique_idx
+        ON usage_samples (day);
+      CREATE UNIQUE INDEX IF NOT EXISTS device_usage_samples_month_device_unique_idx
+        ON device_usage_samples (month, device_id);
+    `);
+    insertUsageSampleRows(database, compactedStore.samples);
+    insertDeviceUsageSampleRows(database, compactedStore.deviceUsageSamples);
+    database.prepare(`
+      UPDATE state SET version = ?, updated_at = ? WHERE id = 1
+    `).run(STORE_VERSION, new Date().toISOString());
+    database.prepare(`
+      INSERT INTO metadata (key, value) VALUES ('database_schema_version', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(String(DATABASE_SCHEMA_VERSION));
+    database.exec("COMMIT");
+  } catch (error) {
+    try {
+      database.exec("ROLLBACK");
+    } catch (rollbackError) {
+      // Preserve the original migration error for the caller.
+    }
     throw error;
   }
 }
@@ -853,7 +1076,8 @@ function readStoreFromDatabase(database) {
   `).get();
   const samples = database.prepare(`
     SELECT captured_at, day, month, rx_bytes, tx_bytes, rx_delta_bytes,
-      tx_delta_bytes, usage_bytes, counter_reset, offline_gap_json, sample_count
+      tx_delta_bytes, usage_bytes, counter_reset, offline_gap_json, sample_count,
+      poll_count
     FROM usage_samples
     ORDER BY captured_at ASC
   `).all().map((sample) => ({
@@ -868,10 +1092,12 @@ function readStoreFromDatabase(database) {
     counterReset: Boolean(sample.counter_reset),
     offlineGap: parseJsonColumn(sample.offline_gap_json),
     sampleCount: sample.sample_count,
+    pollCount: sample.poll_count,
   }));
   const deviceUsageSamples = database.prepare(`
     SELECT captured_at, day, month, device_id, name, mac, ip,
-      rx_delta_bytes, tx_delta_bytes, usage_bytes, counter_reset, baseline
+      rx_delta_bytes, tx_delta_bytes, usage_bytes, counter_reset, baseline,
+      poll_count
     FROM device_usage_samples
     ORDER BY captured_at ASC, device_id ASC
   `).all().map((sample) => ({
@@ -887,6 +1113,7 @@ function readStoreFromDatabase(database) {
     usageBytes: sample.usage_bytes,
     counterReset: Boolean(sample.counter_reset),
     baseline: Boolean(sample.baseline),
+    pollCount: sample.poll_count,
   }));
 
   return normalizeStore({
@@ -937,18 +1164,115 @@ function migrateLegacyJson(database) {
 }
 
 /**
+ * Upserts normalized WAN aggregates by calendar day. Updating the existing row
+ * keeps its identity stable while replacing its exact counters and accumulated
+ * poll count with the latest in-memory aggregate.
+ *
+ * @param {object} database The initialized SQLite database connection.
+ * @param {object[]} rows Normalized daily WAN aggregates to persist.
+ * @returns {void}
+ */
+function insertUsageSampleRows(database, rows) {
+  const insertSample = database.prepare(`
+    INSERT INTO usage_samples (
+      captured_at, day, month, rx_bytes, tx_bytes, rx_delta_bytes,
+      tx_delta_bytes, usage_bytes, counter_reset, offline_gap_json,
+      sample_count, poll_count
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(day) DO UPDATE SET
+      captured_at = excluded.captured_at,
+      month = excluded.month,
+      rx_bytes = excluded.rx_bytes,
+      tx_bytes = excluded.tx_bytes,
+      rx_delta_bytes = excluded.rx_delta_bytes,
+      tx_delta_bytes = excluded.tx_delta_bytes,
+      usage_bytes = excluded.usage_bytes,
+      counter_reset = excluded.counter_reset,
+      offline_gap_json = excluded.offline_gap_json,
+      sample_count = excluded.sample_count,
+      poll_count = excluded.poll_count
+  `);
+  rows.forEach((usageSample) => {
+    insertSample.run(
+      usageSample.capturedAt,
+      usageSample.day,
+      usageSample.month,
+      normalizeCounter(usageSample.rxBytes),
+      normalizeCounter(usageSample.txBytes),
+      normalizeCounter(usageSample.rxDeltaBytes),
+      normalizeCounter(usageSample.txDeltaBytes),
+      normalizeCounter(usageSample.usageBytes),
+      usageSample.counterReset ? 1 : 0,
+      serializeJsonColumn(usageSample.offlineGap),
+      normalizePersistedCount(usageSample.sampleCount, 0),
+      Math.max(1, normalizePersistedCount(usageSample.pollCount, 1)),
+    );
+  });
+}
+
+/**
+ * Upserts normalized device aggregates by calendar month and stable identity.
+ * This key bounds long-running persistence while retaining exact per-device
+ * deltas for every identity admitted by the monthly safety ceiling.
+ *
+ * @param {object} database The initialized SQLite database connection.
+ * @param {object[]} rows Normalized monthly device aggregates to persist.
+ * @returns {void}
+ */
+function insertDeviceUsageSampleRows(database, rows) {
+  const insertDeviceSample = database.prepare(`
+    INSERT INTO device_usage_samples (
+      captured_at, day, month, device_id, name, mac, ip, rx_delta_bytes,
+      tx_delta_bytes, usage_bytes, counter_reset, baseline, poll_count
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(month, device_id) DO UPDATE SET
+      captured_at = excluded.captured_at,
+      day = excluded.day,
+      name = excluded.name,
+      mac = excluded.mac,
+      ip = excluded.ip,
+      rx_delta_bytes = excluded.rx_delta_bytes,
+      tx_delta_bytes = excluded.tx_delta_bytes,
+      usage_bytes = excluded.usage_bytes,
+      counter_reset = excluded.counter_reset,
+      baseline = excluded.baseline,
+      poll_count = excluded.poll_count
+  `);
+  rows.forEach((deviceSample) => {
+    insertDeviceSample.run(
+      deviceSample.capturedAt,
+      deviceSample.day,
+      deviceSample.month,
+      String(deviceSample.deviceId).slice(0, MAX_DEVICE_FIELD_LENGTH),
+      deviceSample.name ? String(deviceSample.name).slice(0, MAX_DEVICE_FIELD_LENGTH) : null,
+      deviceSample.mac ? String(deviceSample.mac).slice(0, MAX_DEVICE_FIELD_LENGTH) : null,
+      deviceSample.ip ? String(deviceSample.ip).slice(0, MAX_DEVICE_FIELD_LENGTH) : null,
+      normalizeCounter(deviceSample.rxDeltaBytes),
+      normalizeCounter(deviceSample.txDeltaBytes),
+      normalizeCounter(deviceSample.usageBytes),
+      deviceSample.counterReset ? 1 : 0,
+      deviceSample.baseline ? 1 : 0,
+      Math.max(1, normalizePersistedCount(deviceSample.pollCount, 1)),
+    );
+  });
+}
+
+/**
  * Writes singleton state and optional new history rows inside one SQLite
- * transaction. Incremental writes use unique timestamps to avoid duplicating
- * samples when the in-memory store contains previously persisted history.
+ * transaction. Incremental writes replace only the touched daily WAN and
+ * monthly device keys with their latest exact aggregates.
  *
  * @param {object} database The initialized SQLite database connection.
  * @param {object} store The normalized store to persist.
- * @param {{sample?:object|null,deviceUsageSamples?:object[],replaceHistory?:boolean}} options Write mode options.
+ * @param {{sample?:object|null,deviceUsageSamples?:object[],deletedDeviceUsageSamples?:object[],replaceHistory?:boolean}} options Write mode options.
  * @returns {void}
  */
 function writeStoreToDatabase(database, store, options = {}) {
   const sample = options.sample || null;
   const deviceUsageSamples = Array.isArray(options.deviceUsageSamples) ? options.deviceUsageSamples : [];
+  const deletedDeviceUsageSamples = Array.isArray(options.deletedDeviceUsageSamples)
+    ? options.deletedDeviceUsageSamples
+    : [];
   const replaceHistory = Boolean(options.replaceHistory);
 
   database.exec("BEGIN IMMEDIATE");
@@ -977,51 +1301,18 @@ function writeStoreToDatabase(database, store, options = {}) {
     );
 
     const sampleRows = replaceHistory ? store.samples : sample ? [sample] : [];
-    const insertSample = database.prepare(`
-      INSERT OR IGNORE INTO usage_samples (
-        captured_at, day, month, rx_bytes, tx_bytes, rx_delta_bytes,
-        tx_delta_bytes, usage_bytes, counter_reset, offline_gap_json, sample_count
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    insertUsageSampleRows(database, sampleRows);
+    const deleteDeviceSample = database.prepare(`
+      DELETE FROM device_usage_samples WHERE month = ? AND device_id = ?
     `);
-    sampleRows.forEach((usageSample) => {
-      insertSample.run(
-        usageSample.capturedAt,
-        usageSample.day,
-        usageSample.month,
-        usageSample.rxBytes,
-        usageSample.txBytes,
-        usageSample.rxDeltaBytes,
-        usageSample.txDeltaBytes,
-        usageSample.usageBytes,
-        usageSample.counterReset ? 1 : 0,
-        serializeJsonColumn(usageSample.offlineGap),
-        Number(usageSample.sampleCount) || 0,
+    deletedDeviceUsageSamples.forEach((deviceSample) => {
+      deleteDeviceSample.run(
+        String(deviceSample.month),
+        String(deviceSample.deviceId).slice(0, MAX_DEVICE_FIELD_LENGTH),
       );
     });
-
-    const insertDeviceSample = database.prepare(`
-      INSERT OR IGNORE INTO device_usage_samples (
-        captured_at, day, month, device_id, name, mac, ip, rx_delta_bytes,
-        tx_delta_bytes, usage_bytes, counter_reset, baseline
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
     const deviceRows = replaceHistory ? store.deviceUsageSamples : deviceUsageSamples;
-    deviceRows.forEach((deviceSample) => {
-      insertDeviceSample.run(
-        deviceSample.capturedAt,
-        deviceSample.day,
-        deviceSample.month,
-        String(deviceSample.deviceId),
-        deviceSample.name || null,
-        deviceSample.mac || null,
-        deviceSample.ip || null,
-        deviceSample.rxDeltaBytes,
-        deviceSample.txDeltaBytes,
-        deviceSample.usageBytes,
-        deviceSample.counterReset ? 1 : 0,
-        deviceSample.baseline ? 1 : 0,
-      );
-    });
+    insertDeviceUsageSampleRows(database, deviceRows);
     database.exec("COMMIT");
   } catch (error) {
     try {
@@ -1587,19 +1878,24 @@ function getDeviceCounterAvailability(device) {
 }
 
 /**
- * Converts the live per-device counters into interval usage rows. The first
- * counter seen for a device establishes a baseline; later samples use exact
- * RX/TX deltas and handle counter resets without generating negative usage.
+ * Converts live per-device counters into monthly aggregates. The first counter
+ * seen for a device establishes a baseline; later samples use exact RX/TX
+ * deltas and handle counter resets without generating negative usage. Only the
+ * aggregates touched by this poll are returned for an incremental database
+ * upsert.
  *
  * @param {object} store The mutable persisted usage store.
  * @param {object[]} devices The freshly sampled device records.
  * @param {Date} capturedAt Timestamp shared by the router snapshot.
- * @returns {void}
+ * @returns {{upserts:object[],deleted:object[]}} Updated aggregates and any
+ * rows evicted by the monthly identity ceiling.
  */
 function recordDeviceUsageSamples(store, devices, capturedAt) {
   const previousDevices = new Map((store.lastDevices?.devices || []).map((device) => [device.id, device]));
+  const previousUsageSamples = store.deviceUsageSamples;
   const day = getCalendarKey(capturedAt, "day");
   const month = getCalendarKey(capturedAt, "month");
+  const intervalSamples = [];
 
   devices.forEach((device) => {
     const availability = getDeviceCounterAvailability(device);
@@ -1616,7 +1912,7 @@ function recordDeviceUsageSamples(store, devices, capturedAt) {
       ? (previousAvailability.hasTx ? calculateCounterDelta(device.txBytes, previous.txBytes) : { delta: "0", reset: false })
       : { delta: "0", reset: false };
 
-    store.deviceUsageSamples.push({
+    intervalSamples.push({
       capturedAt: capturedAt.toISOString(),
       day,
       month,
@@ -1630,12 +1926,28 @@ function recordDeviceUsageSamples(store, devices, capturedAt) {
       counterReset: Boolean(rxDelta.reset || txDelta.reset),
       baseline: !(previousAvailability.hasRx && availability.hasRx)
         && !(previousAvailability.hasTx && availability.hasTx),
+      pollCount: 1,
     });
   });
+
+  if (intervalSamples.length === 0) {
+    return { upserts: [], deleted: [] };
+  }
+
+  const touchedKeys = new Set(intervalSamples.map((sample) => `${sample.month}\0${sample.deviceId}`));
+  store.deviceUsageSamples = compactDeviceUsageSamples([
+    ...store.deviceUsageSamples,
+    ...intervalSamples,
+  ]);
+  const retainedKeys = new Set(store.deviceUsageSamples.map((sample) => `${sample.month}\0${sample.deviceId}`));
+  return {
+    upserts: store.deviceUsageSamples.filter((sample) => touchedKeys.has(`${sample.month}\0${sample.deviceId}`)),
+    deleted: previousUsageSamples.filter((sample) => !retainedKeys.has(`${sample.month}\0${sample.deviceId}`)),
+  };
 }
 
 /**
- * Aggregates stored per-device interval rows for the selected calendar month.
+ * Aggregates stored per-device rows for the selected calendar month.
  * The result is keyed by the stable device identity so the live device list can
  * display a monthly value without exposing raw router counters to the user.
  *
@@ -1659,7 +1971,7 @@ function buildDeviceUsageSummary(store, monthKey) {
     current.usageBytes = addCounterStrings(current.usageBytes, sample.usageBytes);
     current.rxUsageBytes = addCounterStrings(current.rxUsageBytes, sample.rxDeltaBytes);
     current.txUsageBytes = addCounterStrings(current.txUsageBytes, sample.txDeltaBytes);
-    current.sampleCount += 1;
+    current.sampleCount += Math.max(1, normalizePersistedCount(sample.pollCount, 1));
     current.baselineOnly = current.baselineOnly && Boolean(sample.baseline);
     if (!current.latestCapturedAt || sample.capturedAt > current.latestCapturedAt) {
       current.latestCapturedAt = sample.capturedAt;
@@ -2211,7 +2523,7 @@ function buildSummary(store, monthKey) {
   filteredSamples.forEach((sample) => {
     const current = dailyMap.get(sample.day) || { day: sample.day, usageBytes: "0", sampleCount: 0 };
     current.usageBytes = addCounterStrings(current.usageBytes, sample.usageBytes);
-    current.sampleCount += 1;
+    current.sampleCount += Math.max(1, normalizePersistedCount(sample.pollCount, 1));
     dailyMap.set(sample.day, current);
   });
 
@@ -2231,7 +2543,9 @@ function buildSummary(store, monthKey) {
     projectedMonthEndBytes,
     daysRecorded,
     daily,
-    sampleCount: filteredSamples.length,
+    sampleCount: filteredSamples.reduce((total, sample) => (
+      Math.min(Number.MAX_SAFE_INTEGER, total + Math.max(1, normalizePersistedCount(sample.pollCount, 1)))
+    ), 0),
     rxBytes: store.lastCounters?.rxBytes || "0",
     txBytes: store.lastCounters?.txBytes || "0",
     lastSyncAt: store.lastRouter?.capturedAt || null,
@@ -2289,7 +2603,6 @@ async function collectSnapshot() {
 async function collectSnapshotInternal() {
   const store = await readUsageStore();
   const stats = await getRouterStats();
-  const deviceUsageSampleStart = store.deviceUsageSamples.length;
   let deviceSnapshot;
   try {
     deviceSnapshot = await queryRouterDevices();
@@ -2334,10 +2647,15 @@ async function collectSnapshotInternal() {
     counterReset,
     offlineGap,
     sampleCount: stats.records.length,
+    pollCount: 1,
   };
 
+  let deviceUsageSamples = [];
+  let deletedDeviceUsageSamples = [];
   if (deviceSnapshot.sampled) {
-    recordDeviceUsageSamples(store, deviceSnapshot.devices, capturedAt);
+    const devicePersistenceChanges = recordDeviceUsageSamples(store, deviceSnapshot.devices, capturedAt);
+    deviceUsageSamples = devicePersistenceChanges.upserts;
+    deletedDeviceUsageSamples = devicePersistenceChanges.deleted;
   }
 
   if (!store.baseline) {
@@ -2361,10 +2679,15 @@ async function collectSnapshotInternal() {
     usageAvailable: deviceSnapshot.usageAvailable,
     error: deviceSnapshot.error || null,
   };
-  store.samples.push(sample);
+  store.samples = compactUsageSamples([...store.samples, sample]);
+  const dailySample = store.samples.find((storedSample) => storedSample.day === day);
+  if (!dailySample) {
+    throw new Error("The current usage sample could not be normalized for persistence.");
+  }
   await persistUsageStore(store, {
-    sample,
-    deviceUsageSamples: store.deviceUsageSamples.slice(deviceUsageSampleStart),
+    sample: dailySample,
+    deviceUsageSamples,
+    deletedDeviceUsageSamples,
   });
 
   return buildSummary(store, month);
@@ -2869,6 +3192,7 @@ function startBackgroundCollection() {
  */
 function startServer() {
   const config = getConfig();
+  getStorageBackend();
   const server = http.createServer({
     headersTimeout: 10_000,
     keepAliveTimeout: 5_000,

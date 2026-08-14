@@ -9,7 +9,7 @@ The router does not expose a ready-made monthly usage history. Its embedded UI e
 - `/html/bbsp/common/get_wan_list_ipwanstat.asp`
 - `/html/bbsp/common/get_wan_list_pppwanstat.asp`
 
-The local Node server logs into the router, reads RX/TX bytes, calculates the delta since the previous sample, and stores settings and history in `data/fiberx.sqlite` when the built-in SQLite API is available. Older Node.js runtimes automatically fall back to `data/usage.json`. The browser only talks to `127.0.0.1`, so the router password is never sent to the browser or committed to this project.
+The local Node server logs into the router, reads RX/TX bytes, calculates the delta since the previous sample, and stores settings and history in `data/fiberx.sqlite`. A JSON backend remains available as a recovery fallback if the built-in SQLite API is unavailable. Database migration errors stop startup instead of silently splitting future samples into another backend. The browser only talks to `127.0.0.1`, so the router password is never sent to the browser or committed to this project.
 
 On first startup with SQLite available, an existing `data/usage.json` is imported automatically and left untouched as a recoverable backup. When SQLite is unavailable, the JSON file remains the active store.
 
@@ -33,7 +33,7 @@ node server.js
 
 TLS certificate verification is enabled by default. For a self-signed router certificate, prefer setting `ROUTER_TLS_FINGERPRINT256` to the verified SHA-256 fingerprint of the router's leaf certificate; FiberX checks the pin before transmitting the login request. `ROUTER_INSECURE_TLS=true` remains an explicit last-resort exception and makes the router login vulnerable to interception by another device on that network. A plaintext `http://` router URL is rejected unless `ROUTER_ALLOW_PLAINTEXT_HTTP=true` is also explicitly set. The dashboard server is hard-bound to `127.0.0.1` and does not accept a configurable public bind address.
 
-The server-owned 30-second collector is not realtime streaming. It reads cumulative router counters on each poll and records the interval delta, so the latest value can be up to one polling interval old. The device table uses the same cadence when per-device counters are available.
+The server-owned 30-second collector is not realtime streaming. It reads cumulative router counters on each poll and records the interval delta, so the latest value can be up to one polling interval old. Exact WAN deltas are compacted into one row per day, and available per-device deltas into one row per device per month, so leaving the collector running does not create an unbounded stream of database rows. A compromised router cannot rotate more than 2,048 stored device identities per month; established devices with the most observations take precedence while WAN totals remain exact. The device table uses the same polling cadence when per-device counters are available.
 
 All dashboard routes except the data-free `/healthz` probe require authentication, including static assets. GET endpoints are read-only. Manual router synchronization and settings changes use same-origin JSON POST requests. The server validates the exact loopback `Host` and browser origin, rejects cross-site API requests, and sends a restrictive browser security policy to defend the local service against local multi-user access, DNS rebinding, CSRF, framing, and content-type confusion.
 
