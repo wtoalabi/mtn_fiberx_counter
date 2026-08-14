@@ -196,7 +196,10 @@ final class FiberXMenuBarController: NSObject, NSApplicationDelegate {
     ///
     /// - Parameter sender: The menu item that invoked this action.
     @objc private func openLogs(_ sender: Any?) {
-        let logsURL = URL(fileURLWithPath: "~/Library/Logs/FiberX".expandingTildeInPath)
+        let logsURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Logs", isDirectory: true)
+            .appendingPathComponent("FiberX", isDirectory: true)
         NSWorkspace.shared.open(logsURL)
     }
 
