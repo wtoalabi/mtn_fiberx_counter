@@ -67,6 +67,27 @@ The included launcher installs a per-user LaunchAgent and keeps the collector ru
 
 The launcher checks the Node.js version and configuration, starts the service at login, and verifies the local dashboard. Logs are written to `~/Library/Logs/FiberX/`.
 
+## Add a macOS menu-bar icon
+
+The optional menu-bar companion gives you a FiberX icon in the macOS menu bar. Clicking it opens the dashboard in your default browser, shows whether the local service is running, restarts the collection service, and opens the FiberX logs.
+
+Install the background collector first, then build and install the companion:
+
+```sh
+./start-fiberx.sh
+./macos/install-menubar-app.sh
+```
+
+This uses the Swift compiler and AppKit already provided by macOS. It does not require the paid Apple Developer Program. The installer ad-hoc signs the app for use on the Mac where it was built; it is not notarized and is not intended for App Store distribution. If macOS shows a verification warning the first time, control-click `~/Applications/FiberX.app`, choose **Open**, and confirm.
+
+To remove only the menu-bar companion:
+
+```sh
+./macos/uninstall-menubar-app.sh
+```
+
+The collector, `.env`, local history, and logs are left in place.
+
 ## How usage is measured
 
 The router exposes cumulative receive (RX) and transmit (TX) byte counters, not a ready-made monthly history. FiberX samples those counters and records the difference between successful samples. The first successful sample establishes a baseline, so it records zero usage by design. Later samples are grouped by day and month.

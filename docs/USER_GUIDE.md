@@ -130,6 +130,25 @@ The launcher starts FiberX at login and restarts it if it exits. Its logs are in
 - `~/Library/Logs/FiberX/server.log`
 - `~/Library/Logs/FiberX/server-error.log`
 
+### Optional menu-bar companion
+
+If you want FiberX available from the macOS menu bar, install the collector and then run:
+
+```sh
+./start-fiberx.sh
+./macos/install-menubar-app.sh
+```
+
+The menu-bar icon opens the local dashboard, reports whether the collector is running, can restart the collection service, and opens the log directory. It starts at login through a per-user LaunchAgent.
+
+The companion is compiled locally with macOS's Swift compiler and ad-hoc signed. A paid Apple Developer Program membership is not required for this personal/local setup. Because it is not notarized, macOS may ask you to control-click `~/Applications/FiberX.app`, choose **Open**, and confirm on first launch. This build is not suitable for App Store distribution.
+
+Remove the companion without removing FiberX data or the collector:
+
+```sh
+./macos/uninstall-menubar-app.sh
+```
+
 If the computer sleeps, shuts down, or loses access to the router, the collector cannot sample during that period. When it reconnects, FiberX records the next available interval. If the router reset its counters during the gap, the missing usage cannot be calculated reliably.
 
 ## 5. Where data is stored
