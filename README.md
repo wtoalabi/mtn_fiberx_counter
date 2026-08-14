@@ -69,7 +69,7 @@ The launcher checks the Node.js version and configuration, starts the service at
 
 ## Add a macOS menu-bar icon
 
-The optional menu-bar companion gives you a FiberX icon in the macOS menu bar. Clicking it opens the dashboard in your default browser, shows whether the local service is running, restarts the collection service, and opens the FiberX logs.
+The optional menu-bar companion gives you a FiberX icon in the macOS menu bar. Clicking it opens a compact dropdown with total usage this month, today's usage, recent download/upload speed, daily average, projected month-end usage, plan status, router status, and last sync time. The full dashboard is still available as an optional menu action, but it is not needed for routine checks.
 
 Install the background collector first, then build and install the companion:
 

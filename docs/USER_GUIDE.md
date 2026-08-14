@@ -139,7 +139,7 @@ If you want FiberX available from the macOS menu bar, install the collector and 
 ./macos/install-menubar-app.sh
 ```
 
-The menu-bar icon opens the local dashboard, reports whether the collector is running, can restart the collection service, and opens the log directory. It starts at login through a per-user LaunchAgent.
+The menu-bar icon opens a compact native dropdown with total usage this month, today's usage, recent download/upload speed, daily average, projected month-end usage, plan status, router status, and last sync time. The full dashboard remains an optional menu action rather than a requirement for routine checks. The companion can also restart the collection service and open the log directory. It starts at login through a per-user LaunchAgent.
 
 The companion is compiled locally with macOS's Swift compiler and ad-hoc signed. A paid Apple Developer Program membership is not required for this personal/local setup. Because it is not notarized, macOS may ask you to control-click `~/Applications/FiberX.app`, choose **Open**, and confirm on first launch. This build is not suitable for App Store distribution.
 

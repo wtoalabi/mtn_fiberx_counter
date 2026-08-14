@@ -37,7 +37,7 @@ const ALLOWED_DOT_ENV_KEYS = new Set([
   "ROUTER_USERNAME",
   "USAGE_TIMEZONE",
 ]);
-const STORE_VERSION = 5;
+const STORE_VERSION = 6;
 const DATABASE_SCHEMA_VERSION = 2;
 const MINIMUM_NODE_VERSION = Object.freeze([24, 18, 1]);
 const MAX_COUNTER_DIGITS = 128;
@@ -2503,6 +2503,68 @@ function divideCounter(counter, divisor) {
 }
 
 /**
+ * Calculates a recent WAN transfer rate from the two most recent cumulative
+ * router counter samples. The rate is intentionally labeled as an interval
+ * average because the router exposes counters rather than a realtime speed
+ * stream. A counter reset or malformed timestamp makes the rate unavailable.
+ *
+ * @param {object|null|undefined} lastCounters The current counters and the
+ *   previous sample retained by the collector.
+ * @returns {{available:boolean,rxBytesPerSecond:string,txBytesPerSecond:string,intervalSeconds:number,capturedAt:string|null,reason:string|null}} Public speed telemetry.
+ */
+function getPublicSpeedSummary(lastCounters) {
+  const current = lastCounters && typeof lastCounters === "object" ? lastCounters : null;
+  const previous = current?.previous && typeof current.previous === "object" ? current.previous : null;
+  if (!current || !previous) {
+    return {
+      available: false,
+      rxBytesPerSecond: "0",
+      txBytesPerSecond: "0",
+      intervalSeconds: 0,
+      capturedAt: current?.capturedAt || null,
+      reason: "Waiting for a second router sample.",
+    };
+  }
+
+  const currentTimestamp = Date.parse(String(current.capturedAt || ""));
+  const previousTimestamp = Date.parse(String(previous.capturedAt || ""));
+  const elapsedSeconds = (currentTimestamp - previousTimestamp) / 1_000;
+  if (!Number.isFinite(elapsedSeconds) || elapsedSeconds <= 0) {
+    return {
+      available: false,
+      rxBytesPerSecond: "0",
+      txBytesPerSecond: "0",
+      intervalSeconds: 0,
+      capturedAt: current.capturedAt || null,
+      reason: "The router sample interval is unavailable.",
+    };
+  }
+
+  const rxDelta = calculateCounterDelta(current.rxBytes, previous.rxBytes);
+  const txDelta = calculateCounterDelta(current.txBytes, previous.txBytes);
+  if (rxDelta.reset || txDelta.reset) {
+    return {
+      available: false,
+      rxBytesPerSecond: "0",
+      txBytesPerSecond: "0",
+      intervalSeconds: Math.max(1, Math.round(elapsedSeconds)),
+      capturedAt: current.capturedAt || null,
+      reason: "Waiting for a stable counter after the router reset.",
+    };
+  }
+
+  const intervalSeconds = Math.max(1, Math.round(elapsedSeconds));
+  return {
+    available: true,
+    rxBytesPerSecond: divideCounter(rxDelta.delta, intervalSeconds),
+    txBytesPerSecond: divideCounter(txDelta.delta, intervalSeconds),
+    intervalSeconds,
+    capturedAt: current.capturedAt || null,
+    reason: null,
+  };
+}
+
+/**
  * Returns the number of days in a YYYY-MM calendar month for projection math.
  *
  * @param {string} monthKey A YYYY-MM month key.
@@ -2537,12 +2599,14 @@ function buildSummary(store, monthKey) {
   const totalUsageBytes = daily.reduce((total, row) => addCounterStrings(total, row.usageBytes), "0");
   const daysRecorded = daily.length;
   const latest = daily[daysRecorded - 1] || null;
+  const today = dailyMap.get(getCalendarKey(new Date(), "day")) || null;
   const dailyAverageBytes = divideCounter(totalUsageBytes, daysRecorded);
   const projectedMonthEndBytes = daysRecorded ? (BigInt(dailyAverageBytes) * BigInt(getDaysInMonth(monthKey))).toString() : "0";
 
   return {
     month: monthKey,
     totalUsageBytes,
+    todayUsageBytes: today ? today.usageBytes : "0",
     latestDayUsageBytes: latest ? latest.usageBytes : "0",
     latestDay: latest ? latest.day : null,
     dailyAverageBytes,
@@ -2557,6 +2621,7 @@ function buildSummary(store, monthKey) {
     lastSyncAt: store.lastRouter?.capturedAt || null,
     baselineAt: store.baseline?.capturedAt || null,
     lastOfflineGap: store.lastOfflineGap || null,
+    speed: getPublicSpeedSummary(store.lastCounters),
     settings: store.settings,
     devices: (store.lastDevices?.devices || []).map((device) => ({
       ...device,
@@ -2671,7 +2736,18 @@ async function collectSnapshotInternal() {
       txBytes: stats.txBytes,
     };
   }
-  store.lastCounters = { capturedAt: capturedAt.toISOString(), rxBytes: stats.rxBytes, txBytes: stats.txBytes };
+  store.lastCounters = {
+    capturedAt: capturedAt.toISOString(),
+    rxBytes: stats.rxBytes,
+    txBytes: stats.txBytes,
+    previous: previous
+      ? {
+        capturedAt: previous.capturedAt,
+        rxBytes: previous.rxBytes,
+        txBytes: previous.txBytes,
+      }
+      : null,
+  };
   store.lastOfflineGap = offlineGap || store.lastOfflineGap;
   store.lastRouter = {
     connected: true,
