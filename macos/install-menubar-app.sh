@@ -81,7 +81,7 @@ read_dashboard_port() {
     return
   fi
   [[ "${configured_port}" =~ ^[0-9]+$ ]] || die "PORT must be a number between 1 and 65535."
-  (( configured_port >= 1 && configured_port <= 65_535 )) || die "PORT must be a number between 1 and 65535."
+  (( configured_port >= 1 && configured_port <= 65535 )) || die "PORT must be a number between 1 and 65535."
   FIBERX_PORT="${configured_port}"
 }
 
