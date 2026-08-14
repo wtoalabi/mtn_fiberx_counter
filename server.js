@@ -6,10 +6,20 @@ const http = require("node:http");
 const https = require("node:https");
 const path = require("node:path");
 const { URL } = require("node:url");
+let DatabaseSync = null;
+
+try {
+  ({ DatabaseSync } = require("node:sqlite"));
+} catch (error) {
+  DatabaseSync = null;
+}
 
 const ROOT_DIRECTORY = __dirname;
 const DATA_DIRECTORY = path.join(ROOT_DIRECTORY, "data");
-const DATA_FILE = path.join(DATA_DIRECTORY, "usage.json");
+const DATABASE_FILE = path.join(DATA_DIRECTORY, "fiberx.sqlite");
+const LEGACY_DATA_FILE = path.join(DATA_DIRECTORY, "usage.json");
+const STORE_VERSION = 4;
+const DATABASE_SCHEMA_VERSION = 1;
 const WAN_STATS_ENDPOINTS = [
   "/html/bbsp/common/get_wan_list_ipwanstat.asp",
   "/html/bbsp/common/get_wan_list_pppwanstat.asp",
@@ -75,6 +85,7 @@ const routerSession = {
 let cachedConfig = null;
 let collectionPromise = null;
 let persistenceQueue = Promise.resolve();
+let sqliteDatabase = null;
 let backgroundCollectionTimer = null;
 let lastBackgroundCollectionError = null;
 
@@ -151,7 +162,7 @@ function getConfig() {
  */
 function createEmptyStore() {
   return {
-    version: 3,
+    version: STORE_VERSION,
     settings: {
       planMode: "unlimited",
       capGb: 500,
@@ -180,7 +191,7 @@ function normalizeStore(candidate) {
   const settings = source.settings && typeof source.settings === "object" ? source.settings : {};
 
   return {
-    version: 3,
+    version: STORE_VERSION,
     settings: {
       planMode: settings.planMode === "capped" ? "capped" : empty.settings.planMode,
       capGb: Number.isFinite(Number(settings.capGb)) && Number(settings.capGb) > 0 ? Number(settings.capGb) : empty.settings.capGb,
@@ -197,42 +208,372 @@ function normalizeStore(candidate) {
 }
 
 /**
- * Reads the local history file, returning an empty store when no collection has
- * happened yet. The directory is created lazily so a clean checkout stays
- * free of generated files until the app is used.
+ * Reads the normalized application state from SQLite, importing the legacy JSON
+ * file once when this is the first database open. The database directory is
+ * created lazily so a clean checkout stays free of generated files until the
+ * app is used.
  *
- * @returns {Promise<object>} The normalized usage store.
+ * @returns {Promise<object>} The normalized SQLite-backed usage store.
  */
 async function readUsageStore() {
+  return readStoreFromDatabase(getDatabase());
+}
+
+/**
+ * Serializes SQLite writes through a single promise queue. This prevents a
+ * manual dashboard sync from interleaving with the background collection and
+ * keeps the state row and newly collected samples in one transaction.
+ *
+ * @param {object} store The store to persist.
+ * @param {{sample?:object|null,deviceUsageSamples?:object[],replaceHistory?:boolean}} options Incremental or migration write options.
+ * @returns {Promise<void>} Resolves after the queued write completes.
+ */
+function persistUsageStore(store, options = {}) {
+  persistenceQueue = persistenceQueue.then(() => {
+    writeStoreToDatabase(getDatabase(), store, options);
+  });
+
+  return persistenceQueue;
+}
+
+/**
+ * Opens and initializes the local SQLite database, including its schema and the
+ * one-time import from the previous JSON persistence format.
+ *
+ * @returns {object} The initialized synchronous SQLite database connection.
+ * @throws {Error} When the running Node.js version does not provide node:sqlite
+ * or the database cannot be initialized safely.
+ */
+function getDatabase() {
+  if (sqliteDatabase) {
+    return sqliteDatabase;
+  }
+  if (!DatabaseSync) {
+    throw new Error("SQLite storage requires Node.js 22.5 or newer with node:sqlite enabled.");
+  }
+
+  fs.mkdirSync(DATA_DIRECTORY, { recursive: true });
+  const database = new DatabaseSync(DATABASE_FILE);
+
   try {
-    const contents = await fsPromises.readFile(DATA_FILE, "utf8");
-    return normalizeStore(JSON.parse(contents));
+    database.exec(`
+      PRAGMA foreign_keys = ON;
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+
+      CREATE TABLE IF NOT EXISTS metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        plan_mode TEXT NOT NULL,
+        cap_gb REAL NOT NULL,
+        billing_start_day INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        version INTEGER NOT NULL,
+        baseline_json TEXT,
+        last_counters_json TEXT,
+        last_router_json TEXT,
+        last_devices_json TEXT,
+        last_offline_gap_json TEXT,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS usage_samples (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        captured_at TEXT NOT NULL UNIQUE,
+        day TEXT NOT NULL,
+        month TEXT NOT NULL,
+        rx_bytes TEXT NOT NULL,
+        tx_bytes TEXT NOT NULL,
+        rx_delta_bytes TEXT NOT NULL,
+        tx_delta_bytes TEXT NOT NULL,
+        usage_bytes TEXT NOT NULL,
+        counter_reset INTEGER NOT NULL,
+        offline_gap_json TEXT,
+        sample_count INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS usage_samples_month_idx
+        ON usage_samples (month, captured_at);
+
+      CREATE TABLE IF NOT EXISTS device_usage_samples (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        captured_at TEXT NOT NULL,
+        day TEXT NOT NULL,
+        month TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        name TEXT,
+        mac TEXT,
+        ip TEXT,
+        rx_delta_bytes TEXT NOT NULL,
+        tx_delta_bytes TEXT NOT NULL,
+        usage_bytes TEXT NOT NULL,
+        counter_reset INTEGER NOT NULL,
+        baseline INTEGER NOT NULL,
+        UNIQUE (captured_at, device_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS device_usage_samples_month_idx
+        ON device_usage_samples (month, device_id, captured_at);
+    `);
+    database.prepare(`
+      INSERT OR IGNORE INTO settings (id, plan_mode, cap_gb, billing_start_day)
+      VALUES (1, 'unlimited', 500, 1)
+    `).run();
+    database.prepare(`
+      INSERT OR IGNORE INTO state (
+        id, version, baseline_json, last_counters_json, last_router_json,
+        last_devices_json, last_offline_gap_json, updated_at
+      ) VALUES (1, ?, NULL, NULL, NULL, NULL, NULL, ?)
+    `).run(STORE_VERSION, new Date(0).toISOString());
+    database.prepare(`
+      INSERT OR IGNORE INTO metadata (key, value)
+      VALUES ('database_schema_version', ?)
+    `).run(String(DATABASE_SCHEMA_VERSION));
+
+    migrateLegacyJson(database);
+    sqliteDatabase = database;
+    return sqliteDatabase;
   } catch (error) {
-    if (error && error.code !== "ENOENT") {
-      throw error;
-    }
-    return createEmptyStore();
+    database.close();
+    throw error;
   }
 }
 
 /**
- * Serializes the usage store through a single queue and atomically replaces the
- * local JSON file. This avoids corrupting history when a manual click overlaps
- * the background polling interval.
+ * Parses one nullable JSON column from SQLite without allowing malformed
+ * optional state to prevent the rest of the usage history from loading.
  *
- * @param {object} store The store to persist.
- * @returns {Promise<void>} Resolves after the queued write completes.
+ * @param {string|null|undefined} value A JSON column value.
+ * @returns {object|Array|null} The parsed value or null when absent/invalid.
  */
-function persistUsageStore(store) {
-  const serialized = `${JSON.stringify(store, null, 2)}\n`;
-  persistenceQueue = persistenceQueue.then(async () => {
-    await fsPromises.mkdir(DATA_DIRECTORY, { recursive: true });
-    const temporaryFile = `${DATA_FILE}.tmp`;
-    await fsPromises.writeFile(temporaryFile, serialized, "utf8");
-    await fsPromises.rename(temporaryFile, DATA_FILE);
-  });
+function parseJsonColumn(value) {
+  if (!value) {
+    return null;
+  }
 
-  return persistenceQueue;
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    return null;
+  }
+}
+
+/**
+ * Serializes optional state for a nullable SQLite JSON column.
+ *
+ * @param {object|Array|null|undefined} value A value to serialize.
+ * @returns {string|null} JSON text or null when the value is absent.
+ */
+function serializeJsonColumn(value) {
+  return value === null || typeof value === "undefined" ? null : JSON.stringify(value);
+}
+
+/**
+ * Reads all normalized application state from the SQLite tables used by the
+ * dashboard and reconstructs the store shape consumed by existing functions.
+ *
+ * @param {object} database The initialized SQLite database connection.
+ * @returns {object} A normalized usage store.
+ */
+function readStoreFromDatabase(database) {
+  const settings = database.prepare(`
+    SELECT plan_mode, cap_gb, billing_start_day
+    FROM settings
+    WHERE id = 1
+  `).get();
+  const state = database.prepare(`
+    SELECT version, baseline_json, last_counters_json, last_router_json,
+      last_devices_json, last_offline_gap_json
+    FROM state
+    WHERE id = 1
+  `).get();
+  const samples = database.prepare(`
+    SELECT captured_at, day, month, rx_bytes, tx_bytes, rx_delta_bytes,
+      tx_delta_bytes, usage_bytes, counter_reset, offline_gap_json, sample_count
+    FROM usage_samples
+    ORDER BY captured_at ASC
+  `).all().map((sample) => ({
+    capturedAt: sample.captured_at,
+    day: sample.day,
+    month: sample.month,
+    rxBytes: sample.rx_bytes,
+    txBytes: sample.tx_bytes,
+    rxDeltaBytes: sample.rx_delta_bytes,
+    txDeltaBytes: sample.tx_delta_bytes,
+    usageBytes: sample.usage_bytes,
+    counterReset: Boolean(sample.counter_reset),
+    offlineGap: parseJsonColumn(sample.offline_gap_json),
+    sampleCount: sample.sample_count,
+  }));
+  const deviceUsageSamples = database.prepare(`
+    SELECT captured_at, day, month, device_id, name, mac, ip,
+      rx_delta_bytes, tx_delta_bytes, usage_bytes, counter_reset, baseline
+    FROM device_usage_samples
+    ORDER BY captured_at ASC, device_id ASC
+  `).all().map((sample) => ({
+    capturedAt: sample.captured_at,
+    day: sample.day,
+    month: sample.month,
+    deviceId: sample.device_id,
+    name: sample.name,
+    mac: sample.mac,
+    ip: sample.ip,
+    rxDeltaBytes: sample.rx_delta_bytes,
+    txDeltaBytes: sample.tx_delta_bytes,
+    usageBytes: sample.usage_bytes,
+    counterReset: Boolean(sample.counter_reset),
+    baseline: Boolean(sample.baseline),
+  }));
+
+  return normalizeStore({
+    version: state?.version || STORE_VERSION,
+    settings: settings ? {
+      planMode: settings.plan_mode,
+      capGb: settings.cap_gb,
+      billingStartDay: settings.billing_start_day,
+    } : null,
+    baseline: parseJsonColumn(state?.baseline_json),
+    lastCounters: parseJsonColumn(state?.last_counters_json),
+    lastRouter: parseJsonColumn(state?.last_router_json),
+    lastDevices: parseJsonColumn(state?.last_devices_json),
+    lastOfflineGap: parseJsonColumn(state?.last_offline_gap_json),
+    deviceUsageSamples,
+    samples,
+  });
+}
+
+/**
+ * Imports the existing JSON store exactly once into SQLite and leaves the JSON
+ * file untouched as a recoverable backup. A metadata marker prevents duplicate
+ * rows when the server is restarted after migration.
+ *
+ * @param {object} database The initialized SQLite database connection.
+ * @returns {void}
+ */
+function migrateLegacyJson(database) {
+  const marker = database.prepare(`
+    SELECT value FROM metadata WHERE key = 'legacy_json_migration'
+  `).get();
+  if (marker) {
+    return;
+  }
+
+  let legacyStore = null;
+  if (fs.existsSync(LEGACY_DATA_FILE)) {
+    const contents = fs.readFileSync(LEGACY_DATA_FILE, "utf8");
+    legacyStore = normalizeStore(JSON.parse(contents));
+  }
+
+  if (legacyStore) {
+    writeStoreToDatabase(database, legacyStore, { replaceHistory: true });
+  }
+  database.prepare(`
+    INSERT INTO metadata (key, value) VALUES ('legacy_json_migration', ?)
+  `).run(legacyStore ? "imported" : "no-legacy-file");
+}
+
+/**
+ * Writes singleton state and optional new history rows inside one SQLite
+ * transaction. Incremental writes use unique timestamps to avoid duplicating
+ * samples when the in-memory store contains previously persisted history.
+ *
+ * @param {object} database The initialized SQLite database connection.
+ * @param {object} store The normalized store to persist.
+ * @param {{sample?:object|null,deviceUsageSamples?:object[],replaceHistory?:boolean}} options Write mode options.
+ * @returns {void}
+ */
+function writeStoreToDatabase(database, store, options = {}) {
+  const sample = options.sample || null;
+  const deviceUsageSamples = Array.isArray(options.deviceUsageSamples) ? options.deviceUsageSamples : [];
+  const replaceHistory = Boolean(options.replaceHistory);
+
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    if (replaceHistory) {
+      database.exec("DELETE FROM usage_samples; DELETE FROM device_usage_samples;");
+    }
+
+    database.prepare(`
+      INSERT OR REPLACE INTO settings (id, plan_mode, cap_gb, billing_start_day)
+      VALUES (1, ?, ?, ?)
+    `).run(store.settings.planMode, store.settings.capGb, store.settings.billingStartDay);
+    database.prepare(`
+      INSERT OR REPLACE INTO state (
+        id, version, baseline_json, last_counters_json, last_router_json,
+        last_devices_json, last_offline_gap_json, updated_at
+      ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      STORE_VERSION,
+      serializeJsonColumn(store.baseline),
+      serializeJsonColumn(store.lastCounters),
+      serializeJsonColumn(store.lastRouter),
+      serializeJsonColumn(store.lastDevices),
+      serializeJsonColumn(store.lastOfflineGap),
+      new Date().toISOString(),
+    );
+
+    const sampleRows = replaceHistory ? store.samples : sample ? [sample] : [];
+    const insertSample = database.prepare(`
+      INSERT OR IGNORE INTO usage_samples (
+        captured_at, day, month, rx_bytes, tx_bytes, rx_delta_bytes,
+        tx_delta_bytes, usage_bytes, counter_reset, offline_gap_json, sample_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    sampleRows.forEach((usageSample) => {
+      insertSample.run(
+        usageSample.capturedAt,
+        usageSample.day,
+        usageSample.month,
+        usageSample.rxBytes,
+        usageSample.txBytes,
+        usageSample.rxDeltaBytes,
+        usageSample.txDeltaBytes,
+        usageSample.usageBytes,
+        usageSample.counterReset ? 1 : 0,
+        serializeJsonColumn(usageSample.offlineGap),
+        Number(usageSample.sampleCount) || 0,
+      );
+    });
+
+    const insertDeviceSample = database.prepare(`
+      INSERT OR IGNORE INTO device_usage_samples (
+        captured_at, day, month, device_id, name, mac, ip, rx_delta_bytes,
+        tx_delta_bytes, usage_bytes, counter_reset, baseline
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const deviceRows = replaceHistory ? store.deviceUsageSamples : deviceUsageSamples;
+    deviceRows.forEach((deviceSample) => {
+      insertDeviceSample.run(
+        deviceSample.capturedAt,
+        deviceSample.day,
+        deviceSample.month,
+        String(deviceSample.deviceId),
+        deviceSample.name || null,
+        deviceSample.mac || null,
+        deviceSample.ip || null,
+        deviceSample.rxDeltaBytes,
+        deviceSample.txDeltaBytes,
+        deviceSample.usageBytes,
+        deviceSample.counterReset ? 1 : 0,
+        deviceSample.baseline ? 1 : 0,
+      );
+    });
+    database.exec("COMMIT");
+  } catch (error) {
+    try {
+      database.exec("ROLLBACK");
+    } catch (rollbackError) {
+      // Preserve the original transaction error for the caller.
+    }
+    throw error;
+  }
 }
 
 /**
@@ -1352,6 +1693,7 @@ async function collectSnapshot() {
 async function collectSnapshotInternal() {
   const store = await readUsageStore();
   const stats = await getRouterStats();
+  const deviceUsageSampleStart = store.deviceUsageSamples.length;
   let deviceSnapshot;
   try {
     deviceSnapshot = await queryRouterDevices();
@@ -1420,7 +1762,10 @@ async function collectSnapshotInternal() {
     error: deviceSnapshot.error || null,
   };
   store.samples.push(sample);
-  await persistUsageStore(store);
+  await persistUsageStore(store, {
+    sample,
+    deviceUsageSamples: store.deviceUsageSamples.slice(deviceUsageSampleStart),
+  });
 
   return buildSummary(store, month);
 }
