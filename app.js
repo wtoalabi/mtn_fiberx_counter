@@ -516,7 +516,7 @@ function renderSummary(summary) {
  * @param {boolean} syncRouter Whether the server should sample the router.
  * @returns {Promise<void>} Resolves after the summary has rendered.
  */
-async function loadUsage(syncRouter = true) {
+async function loadUsage(syncRouter = false) {
   setSyncState(syncRouter);
 
   try {
@@ -620,7 +620,7 @@ async function handleMonthChange() {
  * @returns {Promise<void>} Resolves after the sync attempt completes.
  */
 async function handleManualSync() {
-  await loadUsage(true);
+  await loadUsage(false);
 }
 
 /**

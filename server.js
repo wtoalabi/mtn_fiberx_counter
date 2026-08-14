@@ -2095,11 +2095,12 @@ function parseWanStatsPayload(payload) {
  * diagnostics from internal storage paths and programming errors.
  *
  * @param {string} message Public router diagnostic.
+ * @param {string} code Stable internal category used for safe log de-duplication.
  * @returns {Error & {code:string,exposeToDashboard:boolean}} Tagged router error.
  */
-function createRouterError(message) {
+function createRouterError(message, code = "ERR_FIBERX_ROUTER_REQUEST") {
   const error = new Error(message);
-  error.code = "ERR_FIBERX_ROUTER_REQUEST";
+  error.code = code;
   error.exposeToDashboard = true;
   return error;
 }
@@ -2306,10 +2307,17 @@ function sendRouterRequest(request, body, expectedFingerprint) {
 function formatRouterRequestError(pathname, error) {
   const resetCodes = new Set(["ECONNRESET", "EPIPE", "ERR_STREAM_WRITE_AFTER_END"]);
   if (resetCodes.has(error.code) || error.message === "socket hang up") {
-    return createRouterError(`The router reset the connection while requesting ${pathname}. It may be temporarily locked or the credentials in .env may be invalid.`);
+    return createRouterError(
+      `The router reset the connection while requesting ${pathname}. It may be temporarily locked or the credentials in .env may be invalid.`,
+      "ERR_FIBERX_ROUTER_NETWORK_RESET",
+    );
   }
 
-  return createRouterError(`Router request to ${pathname} failed: ${error.message}`);
+  const lowLevelCode = /^[A-Z0-9_]{1,64}$/.test(String(error.code || "")) ? error.code : "UNKNOWN";
+  return createRouterError(
+    `Router request to ${pathname} failed: ${error.message}`,
+    `ERR_FIBERX_ROUTER_NETWORK_${lowLevelCode}`,
+  );
 }
 
 /**
@@ -2358,11 +2366,15 @@ async function loginToRouter() {
   const waitMilliseconds = routerSession.authBlockedUntil - Date.now();
   if (waitMilliseconds > 0) {
     const waitSeconds = Math.ceil(waitMilliseconds / 1000);
-    throw createRouterError(`Router login is paused for ${waitSeconds}s after a failed attempt. Check .env and wait for the router lockout to clear.`);
+    throw createRouterError(
+      `Router login is paused for ${waitSeconds}s after a failed attempt. Check .env and wait for the router lockout to clear.`,
+      "ERR_FIBERX_ROUTER_AUTH_BACKOFF",
+    );
   }
 
   routerSession.cookies.clear();
   routerSession.loggedIn = false;
+  let shouldPauseAuthentication = false;
 
   try {
     await requestRouter("/");
@@ -2373,6 +2385,7 @@ async function loginToRouter() {
     if (tokenResponse.statusCode >= 400
       || isRouterLoginPage(tokenResponse.body)
       || !/^[A-Za-z0-9._~-]{1,256}$/.test(token)) {
+      shouldPauseAuthentication = true;
       throw createRouterError("The router did not provide a login token. Wait for the router lockout to clear and try again.");
     }
 
@@ -2382,6 +2395,7 @@ async function loginToRouter() {
       Language: "english",
       "x.X_HW_Token": token,
     });
+    shouldPauseAuthentication = true;
     const loginResponse = await requestRouter("/login.cgi", {
       method: "POST",
       body: form.toString(),
@@ -2397,7 +2411,7 @@ async function loginToRouter() {
   } catch (error) {
     routerSession.loggedIn = false;
     routerSession.cookies.clear();
-    routerSession.authBlockedUntil = Date.now() + 300_000;
+    routerSession.authBlockedUntil = shouldPauseAuthentication ? Date.now() + 300_000 : 0;
     throw error;
   }
 }
@@ -3182,9 +3196,13 @@ async function runBackgroundCollection() {
     lastBackgroundCollectionError = null;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Background router sync failed.";
-    if (message !== lastBackgroundCollectionError) {
+    const errorCode = String(error?.code || "");
+    const usesStableErrorCode = errorCode === "ERR_FIBERX_ROUTER_AUTH_BACKOFF"
+      || errorCode.startsWith("ERR_FIBERX_ROUTER_NETWORK_");
+    const errorKey = usesStableErrorCode ? errorCode : message;
+    if (errorKey !== lastBackgroundCollectionError) {
       console.error(`Background router sync failed: ${message}`);
-      lastBackgroundCollectionError = message;
+      lastBackgroundCollectionError = errorKey;
     }
   }
 }
