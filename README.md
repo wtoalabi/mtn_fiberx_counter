@@ -29,6 +29,8 @@ Use the latest patched Node.js 24 LTS release. The enforced minimum is Node.js 2
 node server.js
 ```
 
+Use `node server.js --check-config` to validate `.env` without opening a port or contacting the router. The macOS launcher runs this check before it replaces an existing service.
+
 4. Open [http://127.0.0.1:3000](http://127.0.0.1:3000). The browser will request HTTP Basic authentication. The username defaults to `fiberx`; when `DASHBOARD_PASSWORD` is blank, FiberX creates a random password in `data/dashboard-password` with owner-only permissions. Read it locally with `cat data/dashboard-password`. Set a unique 20+ character `DASHBOARD_PASSWORD` in `.env` instead if you prefer a managed credential; never reuse the router password.
 
 TLS certificate verification is enabled by default. For a self-signed router certificate, prefer setting `ROUTER_TLS_FINGERPRINT256` to the verified SHA-256 fingerprint of the router's leaf certificate; FiberX checks the pin before transmitting the login request. `ROUTER_INSECURE_TLS=true` remains an explicit last-resort exception and makes the router login vulnerable to interception by another device on that network. A plaintext `http://` router URL is rejected unless `ROUTER_ALLOW_PLAINTEXT_HTTP=true` is also explicitly set. The dashboard server is hard-bound to `127.0.0.1` and does not accept a configurable public bind address.

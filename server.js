@@ -66,7 +66,6 @@ const SECURITY_HEADERS = Object.freeze({
 });
 
 PRIVATE_NETWORKS.addSubnet("10.0.0.0", 8, "ipv4");
-PRIVATE_NETWORKS.addSubnet("100.64.0.0", 10, "ipv4");
 PRIVATE_NETWORKS.addSubnet("127.0.0.0", 8, "ipv4");
 PRIVATE_NETWORKS.addSubnet("169.254.0.0", 16, "ipv4");
 PRIVATE_NETWORKS.addSubnet("172.16.0.0", 12, "ipv4");
@@ -3262,5 +3261,26 @@ function startServer() {
   return server;
 }
 
-assertSupportedNodeRuntime();
-startServer();
+/**
+ * Selects the normal server lifecycle or the launcher's non-listening
+ * configuration check. Rejecting unknown arguments prevents a mistyped
+ * operational flag from being silently ignored, while the check mode validates
+ * credentials, network policy, port, and timezone before launchd stops a
+ * healthy existing service.
+ *
+ * @param {string[]} argumentsList Command-line arguments after the script path.
+ * @returns {void}
+ */
+function runApplication(argumentsList) {
+  assertSupportedNodeRuntime();
+  if (argumentsList.length === 1 && argumentsList[0] === "--check-config") {
+    getConfig();
+    return;
+  }
+  if (argumentsList.length > 0) {
+    throw new Error(`Unsupported command-line argument: ${argumentsList[0]}.`);
+  }
+  startServer();
+}
+
+runApplication(process.argv.slice(2));

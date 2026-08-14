@@ -1,8 +1,6 @@
 .DS_Store
-.env
-data/*.json
-data/*.sqlite*
-data/.usage-*.tmp
-data/dashboard-password
+.env*
+!.env.example
+/data/
 node_modules/
 npm-debug.log*

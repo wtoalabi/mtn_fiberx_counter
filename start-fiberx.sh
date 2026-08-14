@@ -121,6 +121,19 @@ validate_runtime() {
 }
 
 ##
+# Validates application configuration without binding the dashboard port or
+# contacting the router. This runs before unloading an existing LaunchAgent so
+# a typo cannot replace a healthy service with a crash loop.
+#
+# @returns Nothing when server-side configuration validation succeeds.
+##
+validate_server_configuration() {
+  if ! "$FIBERX_NODE_BINARY" "$SERVER_FILE" --check-config; then
+    die "server configuration is invalid. Correct .env, then run this launcher again."
+  fi
+}
+
+##
 # Restricts the credential file, telemetry directory, and existing data files
 # to the current OS user. Symbolic links are rejected so the launcher cannot be
 # tricked into changing or later exposing an unrelated filesystem target.
@@ -315,6 +328,7 @@ main() {
   validate_node_version
   validate_runtime
   secure_runtime_paths
+  validate_server_configuration
   read_dashboard_port
   unload_existing_agent
   wait_for_previous_agent_exit
