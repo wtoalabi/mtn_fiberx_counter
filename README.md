@@ -4,6 +4,8 @@ FiberX is a small, local-first dashboard for tracking usage from an MTN FiberX r
 
 It does not use a cloud service, and it does not need a package install.
 
+This project was inspired by [sagenoya/mtn-data-tracker](https://github.com/sagenoya/mtn-data-tracker). FiberX is an independent implementation with its own local storage, authentication, and router-collection behavior.
+
 ![FiberX sign-in screen](docs/images/fiberx-login.png)
 
 ![FiberX dashboard](docs/images/fiberx-dashboard.png)
