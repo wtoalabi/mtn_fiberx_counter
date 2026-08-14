@@ -79,6 +79,16 @@ FiberX binds to `127.0.0.1`, keeps router credentials on the local machine, and 
 
 Read [SECURITY.md](SECURITY.md) before opening a security issue. MTN and Huawei names identify compatible equipment; this project is not affiliated with either company.
 
+## Disclaimer, non-affiliation, and indemnity
+
+FiberX is an independent, community-developed open-source project. It is not created, sponsored, endorsed, authorized, maintained, or supported by MTN Nigeria, MTN Group, Huawei, or any other network operator, carrier, or router manufacturer. “MTN FiberX”, “MTN”, “Huawei”, and related names and marks belong to their respective owners and are used only to identify the service and equipment this project is designed to work with.
+
+FiberX does not connect to MTN’s customer systems or represent itself as an official MTN integration. It reads counters exposed by a compatible local router interface. No permission, endorsement, or authorization from MTN is implied or granted by this repository. Use FiberX only with a router, connection, credentials, and network that you own or are authorized to monitor. Check the terms that apply to your service and equipment before using, modifying, or distributing it.
+
+This software is provided “as is”, without warranties of any kind. The maintainers and contributors are not responsible for service interruption, inaccurate or incomplete usage records, router lockouts, lost data, security incidents caused by local configuration, or any loss resulting from use or inability to use the project. Do not rely on FiberX as an official billing record or as a substitute for information provided by your network operator.
+
+To the maximum extent permitted by applicable law, you agree to indemnify, defend, and hold harmless the maintainers and contributors from claims, damages, losses, liabilities, costs, and expenses (including reasonable legal fees) arising from your use, modification, deployment, or distribution of FiberX; your failure to obtain required authorization; your violation of applicable law or service terms; or your misuse of the project. This does not exclude or limit liability that cannot lawfully be excluded or limited. Consider obtaining legal advice before deploying FiberX for a business, public service, or other third-party use.
+
 ## Development
 
 The application is dependency-free. A lightweight syntax check is available:
