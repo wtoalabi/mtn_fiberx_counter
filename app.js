@@ -522,9 +522,13 @@ async function loadUsage(syncRouter = true) {
   try {
     const query = new URLSearchParams({
       month: dashboardState.month,
-      sync: syncRouter ? "1" : "0",
     });
-    const response = await fetch(`/api/usage?${query.toString()}`, { cache: "no-store" });
+    const response = await fetch(`${syncRouter ? "/api/sync" : "/api/usage"}?${query.toString()}`, syncRouter ? {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+      cache: "no-store",
+    } : { cache: "no-store" });
     const payload = await response.json();
 
     if (!response.ok) {

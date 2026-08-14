@@ -35,6 +35,8 @@ TLS certificate verification is enabled by default. If your router uses a self-s
 
 The server-owned 30-second collector is not realtime streaming. It reads cumulative router counters on each poll and records the interval delta, so the latest value can be up to one polling interval old. The device table uses the same cadence when per-device counters are available.
 
+All dashboard GET endpoints are read-only. Manual router synchronization and settings changes use same-origin JSON POST requests. The server validates the exact loopback `Host` and browser origin, rejects cross-site API requests, and sends a restrictive browser security policy to defend the local service against DNS rebinding, CSRF, framing, and content-type confusion.
+
 ## Run in the background on macOS
 
 Closing the browser does not stop collection as long as `node server.js` remains running. A full laptop shutdown does stop live sampling. When the laptop returns, the collector subtracts the last persisted router counter from the latest counter and records the difference as an offline-gap reconciliation. The exact time distribution is unknown, so the amount is assigned to the return sample. The generated LaunchAgent starts the server at login and restarts it if it exits, so collection resumes after the laptop starts again.

@@ -218,14 +218,14 @@ start_launch_agent() {
 ##
 # Waits briefly for the Node process to bind the configured local port and
 # prints the dashboard and log locations. A slow router does not make setup
-# fail because the health endpoint reads persisted data with sync=0.
+# fail because the health endpoint is a side-effect-free history read.
 #
 # @returns Nothing; prints a warning if the service needs more time to start.
 ##
 report_startup() {
   local attempt=1
   while (( attempt <= 10 )); do
-    if curl --silent --fail --max-time 1 "http://127.0.0.1:${FIBERX_PORT}/api/usage?sync=0" >/dev/null 2>&1; then
+    if curl --silent --fail --max-time 1 "http://127.0.0.1:${FIBERX_PORT}/api/usage" >/dev/null 2>&1; then
       printf 'FiberX is running through LaunchAgent %s.\n' "$SERVICE_LABEL"
       printf 'Dashboard: http://127.0.0.1:%s\n' "$FIBERX_PORT"
       printf 'Logs: %s/server.log and %s/server-error.log\n' "$LOG_DIRECTORY" "$LOG_DIRECTORY"

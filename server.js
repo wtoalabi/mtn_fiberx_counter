@@ -40,11 +40,23 @@ const MAX_COUNTER_DIGITS = 128;
 const MAX_DEVICE_FIELD_LENGTH = 512;
 const MAX_DEVICE_RECORDS = 512;
 const MAX_JSON_NODES = 10_000;
+const MAX_REQUEST_BODY_BYTES = 16_384;
+const MAX_REQUEST_URL_BYTES = 2_048;
 const MAX_ROUTER_BODY_BYTES = 2 * 1_024 * 1_024;
 const MAX_ROUTER_COOKIES = 64;
 const MAX_ROUTER_COOKIE_BYTES = 8_192;
 const MAX_WAN_RECORDS = 128;
 const PRIVATE_NETWORKS = new net.BlockList();
+const SECURITY_HEADERS = Object.freeze({
+  "Content-Security-Policy": "default-src 'none'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self'; object-src 'none'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; trusted-types 'none'; require-trusted-types-for 'script'",
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Resource-Policy": "same-origin",
+  "Permissions-Policy": "accelerometer=(), camera=(), geolocation=(), gyroscope=(), microphone=(), payment=(), usb=()",
+  "Referrer-Policy": "no-referrer",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "X-Permitted-Cross-Domain-Policies": "none",
+});
 
 PRIVATE_NETWORKS.addSubnet("10.0.0.0", 8, "ipv4");
 PRIVATE_NETWORKS.addSubnet("100.64.0.0", 10, "ipv4");
@@ -1638,6 +1650,21 @@ function parseWanStatsPayload(payload) {
 }
 
 /**
+ * Marks a constrained router-client failure as safe for the local dashboard.
+ * Callers use this marker to distinguish expected connection/authentication
+ * diagnostics from internal storage paths and programming errors.
+ *
+ * @param {string} message Public router diagnostic.
+ * @returns {Error & {code:string,exposeToDashboard:boolean}} Tagged router error.
+ */
+function createRouterError(message) {
+  const error = new Error(message);
+  error.code = "ERR_FIBERX_ROUTER_REQUEST";
+  error.exposeToDashboard = true;
+  return error;
+}
+
+/**
  * Merges Set-Cookie response headers into the in-memory router session without
  * writing them to disk or exposing them to the browser.
  *
@@ -1647,7 +1674,7 @@ function parseWanStatsPayload(payload) {
 function mergeRouterCookies(setCookieHeader) {
   const values = Array.isArray(setCookieHeader) ? setCookieHeader : setCookieHeader ? [setCookieHeader] : [];
   if (values.length > MAX_ROUTER_COOKIES) {
-    throw new Error("The router returned too many session cookies.");
+    throw createRouterError("The router returned too many session cookies.");
   }
 
   values.forEach((value) => {
@@ -1663,7 +1690,7 @@ function mergeRouterCookies(setCookieHeader) {
       || name.length > 128
       || cookieValue.length > 4_096
       || /[\x00-\x20\x7f;,]/.test(cookieValue)) {
-      throw new Error("The router returned an invalid session cookie.");
+      throw createRouterError("The router returned an invalid session cookie.");
     }
     if (cookieValue) {
       routerSession.cookies.set(name, cookieValue);
@@ -1673,7 +1700,7 @@ function mergeRouterCookies(setCookieHeader) {
   });
   if (routerSession.cookies.size > MAX_ROUTER_COOKIES || Buffer.byteLength(getRouterCookieHeader()) > MAX_ROUTER_COOKIE_BYTES) {
     routerSession.cookies.clear();
-    throw new Error("The router session cookie limit was exceeded.");
+    throw createRouterError("The router session cookie limit was exceeded.");
   }
 }
 
@@ -1702,16 +1729,16 @@ function requestRouter(pathname, options = {}) {
   const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 10_000;
   const method = String(options.method || "GET").toUpperCase();
   if (target.origin !== config.routerUrl.origin) {
-    throw new Error("Router requests must remain on the configured router origin.");
+    throw createRouterError("Router requests must remain on the configured router origin.");
   }
   if (method !== "GET" && method !== "POST") {
-    throw new Error("Router requests may use only GET or POST.");
+    throw createRouterError("Router requests may use only GET or POST.");
   }
   if (Buffer.byteLength(body) > 16_384) {
-    throw new Error("Router request body is too large.");
+    throw createRouterError("Router request body is too large.");
   }
   if (!Number.isFinite(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 30_000) {
-    throw new Error("Router request timeout is outside the allowed range.");
+    throw createRouterError("Router request timeout is outside the allowed range.");
   }
   const headers = {
     Accept: "*/*",
@@ -1797,10 +1824,10 @@ function requestRouter(pathname, options = {}) {
 function formatRouterRequestError(pathname, error) {
   const resetCodes = new Set(["ECONNRESET", "EPIPE", "ERR_STREAM_WRITE_AFTER_END"]);
   if (resetCodes.has(error.code) || error.message === "socket hang up") {
-    return new Error(`The router reset the connection while requesting ${pathname}. It may be temporarily locked or the credentials in .env may be invalid.`);
+    return createRouterError(`The router reset the connection while requesting ${pathname}. It may be temporarily locked or the credentials in .env may be invalid.`);
   }
 
-  return new Error(`Router request to ${pathname} failed: ${error.message}`);
+  return createRouterError(`Router request to ${pathname} failed: ${error.message}`);
 }
 
 /**
@@ -1843,13 +1870,13 @@ function isRouterWaitingPage(body) {
 async function loginToRouter() {
   const config = getConfig();
   if (!config.routerPassword) {
-    throw new Error("Set ROUTER_PASSWORD before starting the tracker.");
+    throw createRouterError("Set ROUTER_PASSWORD before starting the tracker.");
   }
 
   const waitMilliseconds = routerSession.authBlockedUntil - Date.now();
   if (waitMilliseconds > 0) {
     const waitSeconds = Math.ceil(waitMilliseconds / 1000);
-    throw new Error(`Router login is paused for ${waitSeconds}s after a failed attempt. Check .env and wait for the router lockout to clear.`);
+    throw createRouterError(`Router login is paused for ${waitSeconds}s after a failed attempt. Check .env and wait for the router lockout to clear.`);
   }
 
   routerSession.cookies.clear();
@@ -1864,7 +1891,7 @@ async function loginToRouter() {
     if (tokenResponse.statusCode >= 400
       || isRouterLoginPage(tokenResponse.body)
       || !/^[A-Za-z0-9._~-]{1,256}$/.test(token)) {
-      throw new Error("The router did not provide a login token. Wait for the router lockout to clear and try again.");
+      throw createRouterError("The router did not provide a login token. Wait for the router lockout to clear and try again.");
     }
 
     const form = new URLSearchParams({
@@ -1880,7 +1907,7 @@ async function loginToRouter() {
     });
 
     if (loginResponse.statusCode >= 400 || isRouterLoginPage(loginResponse.body)) {
-      throw new Error("The router login was rejected. Verify ROUTER_USERNAME and ROUTER_PASSWORD in .env, then wait for any Huawei lockout timer to clear.");
+      throw createRouterError("The router login was rejected. Verify ROUTER_USERNAME and ROUTER_PASSWORD in .env, then wait for any Huawei lockout timer to clear.");
     }
 
     routerSession.loggedIn = true;
@@ -1970,7 +1997,7 @@ async function getRouterStats() {
     result = await queryRouterStats();
   }
   if (!result.stats) {
-    throw new Error(result.error || "The router returned no WAN statistics.");
+    throw createRouterError(result.error || "The router returned no WAN statistics.");
   }
 
   return result.stats;
@@ -2076,6 +2103,18 @@ function buildSummary(store, monthKey) {
 }
 
 /**
+ * Validates a calendar month accepted by history and export routes. Restricting
+ * the numeric month prevents ambiguous Date normalization and keeps generated
+ * download filenames inside a fixed, header-safe character set.
+ *
+ * @param {string|null} value Candidate YYYY-MM value.
+ * @returns {string|null} The validated key, or null when invalid.
+ */
+function parseMonthKey(value) {
+  return /^\d{4}-(?:0[1-9]|1[0-2])$/.test(value || "") ? value : null;
+}
+
+/**
  * Samples the live router, calculates exact counter deltas, and persists one
  * history row. A process-wide promise lock prevents concurrent UI requests
  * from double-counting the same interval.
@@ -2106,11 +2145,15 @@ async function collectSnapshotInternal() {
   try {
     deviceSnapshot = await queryRouterDevices();
   } catch (error) {
+    const publicMessage = getPublicRouterErrorMessage(error);
+    if (!error?.exposeToDashboard) {
+      console.error("Connected-device collection failed:", error);
+    }
     deviceSnapshot = {
       devices: store.lastDevices?.devices || [],
       source: store.lastDevices?.source || null,
       usageAvailable: Boolean(store.lastDevices?.usageAvailable),
-      error: error instanceof Error ? error.message : "Connected-device data could not be read.",
+      error: publicMessage,
       sampled: false,
     };
   }
@@ -2187,20 +2230,83 @@ async function collectSnapshotInternal() {
  */
 function readRequestBody(request) {
   return new Promise((resolve, reject) => {
+    const declaredLength = Number(request.headers["content-length"]);
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BODY_BYTES) {
+      request.resume();
+      reject(createHttpError(413, "Request body is too large."));
+      return;
+    }
+
     const chunks = [];
     let size = 0;
+    let rejected = false;
     request.on("data", (chunk) => {
+      if (rejected) {
+        return;
+      }
       size += chunk.length;
-      if (size > 16_384) {
-        reject(new Error("Request body is too large."));
-        request.destroy();
+      if (size > MAX_REQUEST_BODY_BYTES) {
+        rejected = true;
+        reject(createHttpError(413, "Request body is too large."));
         return;
       }
       chunks.push(chunk);
     });
-    request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    request.on("end", () => {
+      if (!rejected) {
+        resolve(Buffer.concat(chunks).toString("utf8"));
+      }
+    });
+    request.on("aborted", () => reject(createHttpError(400, "Request body was interrupted.")));
     request.on("error", reject);
   });
+}
+
+/**
+ * Creates an HTTP error whose status and public message are safe to return to a
+ * client. Unexpected exceptions omit these fields and are converted to a
+ * generic 500 response by the request handler.
+ *
+ * @param {number} statusCode HTTP status code to expose.
+ * @param {string} message Public error message.
+ * @returns {Error & {statusCode:number,expose:boolean}} A controlled HTTP error.
+ */
+function createHttpError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.expose = true;
+  return error;
+}
+
+/**
+ * Writes a response status and headers with the security policy shared by HTML,
+ * JavaScript, JSON, and CSV responses. Route-specific headers may override only
+ * representation details such as content type, length, and cache policy.
+ *
+ * @param {http.ServerResponse} response The outgoing response.
+ * @param {number} statusCode HTTP status code.
+ * @param {Record<string,string|number>} headers Route-specific headers.
+ * @returns {void}
+ */
+function writeSecureHead(response, statusCode, headers = {}) {
+  response.writeHead(statusCode, {
+    ...SECURITY_HEADERS,
+    ...headers,
+  });
+}
+
+/**
+ * Converts a router-collection failure into a message safe for the dashboard.
+ * Network errors created by the constrained router client are actionable;
+ * storage, programming, and OS details remain in the private server log.
+ *
+ * @param {unknown} error Router collection failure.
+ * @returns {string} A public diagnostic without local filesystem internals.
+ */
+function getPublicRouterErrorMessage(error) {
+  return error?.exposeToDashboard && error instanceof Error
+    ? error.message
+    : "Router sync failed. Check the private server log for details.";
 }
 
 /**
@@ -2214,12 +2320,137 @@ function readRequestBody(request) {
  */
 function sendJson(response, statusCode, payload) {
   const serialized = JSON.stringify(payload);
-  response.writeHead(statusCode, {
+  writeSecureHead(response, statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
     "Content-Length": Buffer.byteLength(serialized),
   });
   response.end(serialized);
+}
+
+/**
+ * Validates the loopback request authority before any route or file is served.
+ * Exact Host and local-peer checks stop DNS rebinding from turning an attacker
+ * controlled origin into a same-origin caller of this localhost service.
+ *
+ * @param {http.IncomingMessage} request The incoming request.
+ * @returns {string} The normalized expected browser origin.
+ */
+function validateLoopbackAuthority(request) {
+  const remoteAddress = request.socket.remoteAddress || "";
+  if (remoteAddress !== "127.0.0.1" && remoteAddress !== "::ffff:127.0.0.1") {
+    throw createHttpError(403, "Loopback access only.");
+  }
+
+  const hostHeaderCount = request.rawHeaders.reduce((count, value, index) => (
+    index % 2 === 0 && value.toLowerCase() === "host" ? count + 1 : count
+  ), 0);
+  const hostHeader = request.headers.host;
+  if (hostHeaderCount !== 1 || typeof hostHeader !== "string") {
+    throw createHttpError(400, "A single valid Host header is required.");
+  }
+
+  let authority;
+  try {
+    authority = new URL(`http://${hostHeader}`);
+  } catch (error) {
+    throw createHttpError(400, "The Host header is invalid.");
+  }
+  const hostname = authority.hostname.toLowerCase();
+  const expectedPort = String(getConfig().port);
+  const authorityPort = authority.port || (authority.protocol === "http:" ? "80" : "443");
+  if ((hostname !== "127.0.0.1" && hostname !== "localhost")
+    || authorityPort !== expectedPort
+    || authority.username
+    || authority.password
+    || authority.pathname !== "/"
+    || authority.search
+    || authority.hash) {
+    throw createHttpError(421, "The requested host is not served here.");
+  }
+
+  return authority.origin;
+}
+
+/**
+ * Applies browser-origin and Fetch Metadata checks to local API calls. Command
+ * line clients without browser headers remain usable, while cross-site pages,
+ * sandboxed documents, and browser extensions cannot invoke the router API.
+ *
+ * @param {http.IncomingMessage} request The incoming API request.
+ * @param {string} expectedOrigin Origin derived from the validated Host header.
+ * @returns {void}
+ */
+function validateApiBrowserBoundary(request, expectedOrigin) {
+  const fetchSite = request.headers["sec-fetch-site"];
+  if (typeof fetchSite === "string" && fetchSite !== "same-origin" && fetchSite !== "none") {
+    throw createHttpError(403, "Cross-site API requests are not allowed.");
+  }
+
+  const originHeader = request.headers.origin;
+  if (typeof originHeader === "undefined") {
+    return;
+  }
+  if (typeof originHeader !== "string" || originHeader === "null") {
+    throw createHttpError(403, "The request origin is not allowed.");
+  }
+
+  let origin;
+  try {
+    origin = new URL(originHeader);
+  } catch (error) {
+    throw createHttpError(403, "The request origin is not allowed.");
+  }
+  if (origin.origin !== expectedOrigin
+    || origin.username
+    || origin.password
+    || origin.pathname !== "/"
+    || origin.search
+    || origin.hash) {
+    throw createHttpError(403, "The request origin is not allowed.");
+  }
+}
+
+/**
+ * Enforces JSON on state-changing routes. Requiring a non-simple content type
+ * provides an additional CSRF barrier and gives malformed clients a clear 415
+ * response before any request body is parsed.
+ *
+ * @param {http.IncomingMessage} request The incoming request.
+ * @returns {void}
+ */
+function requireJsonRequest(request) {
+  const contentType = String(request.headers["content-type"] || "").split(";", 1)[0].trim().toLowerCase();
+  const contentEncoding = String(request.headers["content-encoding"] || "identity").trim().toLowerCase();
+  if (contentType !== "application/json") {
+    throw createHttpError(415, "Content-Type must be application/json.");
+  }
+  if (contentEncoding !== "identity") {
+    throw createHttpError(415, "Compressed request bodies are not supported.");
+  }
+}
+
+/**
+ * Reads and parses a bounded JSON request body without reflecting JavaScript
+ * parser diagnostics to the client.
+ *
+ * @param {http.IncomingMessage} request The incoming request.
+ * @returns {Promise<object>} A plain JSON object supplied by the client.
+ */
+async function readJsonRequest(request) {
+  requireJsonRequest(request);
+  const body = await readRequestBody(request);
+  let input;
+  try {
+    input = JSON.parse(body || "{}");
+  } catch (error) {
+    throw createHttpError(400, "Request body must contain valid JSON.");
+  }
+  if (!input || Array.isArray(input) || typeof input !== "object") {
+    throw createHttpError(400, "Request body must contain a JSON object.");
+  }
+
+  return input;
 }
 
 /**
@@ -2258,11 +2489,10 @@ async function serveStaticAsset(response, requestPath) {
     "styles.css": "text/css; charset=utf-8",
     "app.js": "text/javascript; charset=utf-8",
   };
-  response.writeHead(200, {
+  writeSecureHead(response, 200, {
     "Content-Type": contentTypes[assetName],
     "Cache-Control": "no-cache",
     "Content-Length": contents.length,
-    "Content-Security-Policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'",
   });
   response.end(contents);
   return true;
@@ -2276,44 +2506,66 @@ async function serveStaticAsset(response, requestPath) {
  * @returns {Promise<void>} Resolves after the response has completed.
  */
 async function handleRequest(request, response) {
-  const requestUrl = new URL(request.url || "/", "http://127.0.0.1");
-
   try {
+    const expectedOrigin = validateLoopbackAuthority(request);
+    const rawUrl = request.url || "/";
+    if (Buffer.byteLength(rawUrl) > MAX_REQUEST_URL_BYTES
+      || !rawUrl.startsWith("/")
+      || rawUrl.startsWith("//")
+      || rawUrl.includes("\\")) {
+      throw createHttpError(400, "The request target is invalid.");
+    }
+    const requestUrl = new URL(rawUrl, "http://127.0.0.1");
+    const isApiRequest = requestUrl.pathname.startsWith("/api/");
+    if (isApiRequest) {
+      validateApiBrowserBoundary(request, expectedOrigin);
+    }
+
     if (request.method === "GET" && requestUrl.pathname === "/api/usage") {
-      const month = /^\d{4}-\d{2}$/.test(requestUrl.searchParams.get("month") || "") ? requestUrl.searchParams.get("month") : getCalendarKey(new Date(), "month");
-      const shouldSync = requestUrl.searchParams.get("sync") !== "0";
-      let store = await readUsageStore();
-      let summary;
+      const month = parseMonthKey(requestUrl.searchParams.get("month")) || getCalendarKey(new Date(), "month");
+      sendJson(response, 200, buildSummary(await readUsageStore(), month));
+      return;
+    }
 
-      if (shouldSync) {
-        try {
-          summary = await collectSnapshot();
-          store = await readUsageStore();
-        } catch (error) {
-          store.lastRouter = {
-            ...(store.lastRouter || {}),
-            connected: false,
-            lastError: error instanceof Error ? error.message : "Router sync failed.",
-          };
-          summary = buildSummary(store, month);
-          sendJson(response, 503, { ...summary, error: store.lastRouter.lastError, summary });
-          return;
-        }
+    if (request.method === "POST" && requestUrl.pathname === "/api/sync") {
+      const input = await readJsonRequest(request);
+      if (Object.keys(input).length !== 0) {
+        throw createHttpError(400, "Router sync does not accept request fields.");
       }
-
-      summary = summary && summary.month === month ? summary : buildSummary(store, month);
-      sendJson(response, 200, summary);
+      const month = parseMonthKey(requestUrl.searchParams.get("month")) || getCalendarKey(new Date(), "month");
+      let store = await readUsageStore();
+      try {
+        const collectedSummary = await collectSnapshot();
+        store = await readUsageStore();
+        const summary = collectedSummary.month === month ? collectedSummary : buildSummary(store, month);
+        sendJson(response, 200, summary);
+      } catch (error) {
+        const publicMessage = getPublicRouterErrorMessage(error);
+        if (!error?.exposeToDashboard) {
+          console.error("Manual router sync failed:", error);
+        }
+        store.lastRouter = {
+          ...(store.lastRouter || {}),
+          connected: false,
+          lastError: publicMessage,
+        };
+        const summary = buildSummary(store, month);
+        sendJson(response, 503, { ...summary, error: store.lastRouter.lastError, summary });
+      }
       return;
     }
 
     if (request.method === "POST" && requestUrl.pathname === "/api/settings") {
-      const body = await readRequestBody(request);
-      const input = JSON.parse(body || "{}");
+      const input = await readJsonRequest(request);
       const store = await readUsageStore();
       const planMode = input.planMode === "capped" ? "capped" : "unlimited";
       const capGb = Number(input.capGb);
       const billingStartDay = Number(input.billingStartDay);
 
+      if (input.planMode !== "unlimited" && input.planMode !== "capped") {
+        sendJson(response, 400, { error: "Plan mode must be unlimited or capped." });
+        return;
+      }
       if (!Number.isFinite(capGb) || capGb <= 0 || capGb > 100_000) {
         sendJson(response, 400, { error: "Monthly cap must be between 1 and 100000 GB." });
         return;
@@ -2330,12 +2582,13 @@ async function handleRequest(request, response) {
     }
 
     if (request.method === "GET" && requestUrl.pathname === "/api/export.csv") {
-      const month = /^\d{4}-\d{2}$/.test(requestUrl.searchParams.get("month") || "") ? requestUrl.searchParams.get("month") : getCalendarKey(new Date(), "month");
+      const month = parseMonthKey(requestUrl.searchParams.get("month")) || getCalendarKey(new Date(), "month");
       const summary = buildSummary(await readUsageStore(), month);
       const csv = buildCsv(summary);
-      response.writeHead(200, {
+      writeSecureHead(response, 200, {
         "Content-Type": "text/csv; charset=utf-8",
         "Content-Disposition": `attachment; filename="fiberx-${month}.csv"`,
+        "Cache-Control": "no-store",
         "Content-Length": Buffer.byteLength(csv),
       });
       response.end(csv);
@@ -2348,8 +2601,16 @@ async function handleRequest(request, response) {
 
     sendJson(response, 404, { error: "Not found." });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unexpected server error.";
-    sendJson(response, 400, { error: message });
+    if (response.headersSent) {
+      response.destroy();
+      return;
+    }
+    const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+    const message = error?.expose ? error.message : "Unexpected server error.";
+    if (statusCode >= 500) {
+      console.error("Request failed:", error);
+    }
+    sendJson(response, statusCode, { error: message });
   }
 }
 
@@ -2400,8 +2661,22 @@ function startBackgroundCollection() {
  */
 function startServer() {
   const config = getConfig();
-  const server = http.createServer((request, response) => {
+  const server = http.createServer({
+    headersTimeout: 10_000,
+    keepAliveTimeout: 5_000,
+    maxHeaderSize: 16_384,
+    requestTimeout: 15_000,
+    requireHostHeader: true,
+  }, (request, response) => {
     void handleRequest(request, response);
+  });
+  server.maxConnections = 64;
+  server.maxHeadersCount = 64;
+  server.maxRequestsPerSocket = 100;
+  server.on("clientError", (error, socket) => {
+    if (socket.writable) {
+      socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    }
   });
 
   server.listen(config.port, config.host, () => {
