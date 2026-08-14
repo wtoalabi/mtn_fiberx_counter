@@ -4,8 +4,8 @@ const AUTOMATIC_REFRESH_INTERVAL_MS = 30_000;
 
 /**
  * Holds the browser-side view state for the selected month and the most recent
- * response from the local collector. The router password never enters this
- * state because authentication is handled by the localhost server.
+ * response from the local collector. Password material never enters this state;
+ * the localhost server authenticates the HttpOnly session cookie instead.
  */
 const dashboardState = {
   month: getMonthKey(new Date()),
@@ -509,6 +509,22 @@ function renderSummary(summary) {
 }
 
 /**
+ * Sends an expired local session back to the in-app sign-in page. A native
+ * browser authentication prompt is intentionally never triggered by FiberX.
+ *
+ * @param {Response} response Fetch response from a protected endpoint.
+ * @returns {boolean} Whether the response represented an expired session.
+ */
+function redirectToLoginIfUnauthorized(response) {
+  if (response.status !== 401) {
+    return false;
+  }
+
+  window.location.replace("/login");
+  return true;
+}
+
+/**
  * Fetches one normalized summary from the local server and paints it into the
  * dashboard. The sync flag lets month navigation read stored history without
  * creating an unnecessary router sample.
@@ -529,6 +545,9 @@ async function loadUsage(syncRouter = false) {
       body: "{}",
       cache: "no-store",
     } : { cache: "no-store" });
+    if (redirectToLoginIfUnauthorized(response)) {
+      return;
+    }
     const payload = await response.json();
 
     if (!response.ok) {
@@ -578,6 +597,9 @@ async function savePlanSettings() {
         billingStartDay: Number(elements.billingDay.value),
       }),
     });
+    if (redirectToLoginIfUnauthorized(response)) {
+      return;
+    }
     const payload = await response.json();
 
     if (!response.ok) {

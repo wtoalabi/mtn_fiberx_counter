@@ -23,7 +23,7 @@ If private vulnerability reporting is unavailable, contact the maintainer throug
 FiberX treats browser content, router responses, DNS answers, and other local OS accounts as untrusted. The service:
 
 - binds only to `127.0.0.1` and validates the exact loopback authority;
-- requires high-entropy HTTP Basic authentication for every data-bearing route;
+- requires the `.env` dashboard password for every data-bearing route, then protects the browser with an opaque HttpOnly, SameSite session cookie;
 - keeps GET requests read-only and applies same-origin protections to API calls;
 - constrains router connections to private, loopback, and link-local addresses;
 - verifies router TLS certificates, supports certificate pinning for self-signed routers, and requires explicit opt-ins for unverified TLS or plaintext HTTP;
@@ -34,4 +34,4 @@ The checked-out application code, the current OS account, and administrators of 
 
 ## Sensitive diagnostic material
 
-Never attach `.env`, `data/`, `dashboard-password`, LaunchAgent logs, router response bodies, exported CSV files, or screenshots containing device names, IP addresses, or MAC addresses to a public report. If a secret was committed or shared, rotate it immediately; deleting the current file is not enough when it remains in Git history or an external archive.
+Never attach `.env`, `data/`, LaunchAgent logs, router response bodies, exported CSV files, or screenshots containing device names, IP addresses, or MAC addresses to a public report. If a secret was committed or shared, rotate it immediately; deleting the current file is not enough when it remains in Git history or an external archive.

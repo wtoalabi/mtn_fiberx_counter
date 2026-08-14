@@ -25,11 +25,9 @@ const ROOT_DIRECTORY = __dirname;
 const DATA_DIRECTORY = path.join(ROOT_DIRECTORY, "data");
 const ENVIRONMENT_FILE = path.join(ROOT_DIRECTORY, ".env");
 const DATABASE_FILE = path.join(DATA_DIRECTORY, "fiberx.sqlite");
-const DASHBOARD_PASSWORD_FILE = path.join(DATA_DIRECTORY, "dashboard-password");
 const JSON_DATA_FILE = path.join(DATA_DIRECTORY, "usage.json");
 const ALLOWED_DOT_ENV_KEYS = new Set([
   "DASHBOARD_PASSWORD",
-  "DASHBOARD_USERNAME",
   "PORT",
   "ROUTER_ALLOW_PLAINTEXT_HTTP",
   "ROUTER_INSECURE_TLS",
@@ -49,6 +47,15 @@ const MAX_DEVICE_RECORDS = 512;
 const MAX_JSON_NODES = 10_000;
 const MAX_REQUEST_BODY_BYTES = 16_384;
 const MAX_REQUEST_URL_BYTES = 2_048;
+const SESSION_COOKIE_NAME = "fiberx_session";
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
+const SESSION_COOKIE_MAX_AGE_SECONDS = Math.floor(SESSION_TTL_MS / 1_000);
+const MAX_DASHBOARD_SESSIONS = 64;
+const MAX_SESSION_COOKIE_BYTES = 4_096;
+const MAX_DASHBOARD_PASSWORD_LENGTH = 256;
+const DASHBOARD_LOGIN_MAX_ATTEMPTS = 5;
+const DASHBOARD_LOGIN_BASE_BLOCK_MS = 30_000;
+const DASHBOARD_LOGIN_MAX_BLOCK_MS = 15 * 60 * 1_000;
 const MAX_ROUTER_BODY_BYTES = 2 * 1_024 * 1_024;
 const MAX_ROUTER_COOKIES = 64;
 const MAX_ROUTER_COOKIE_BYTES = 8_192;
@@ -143,6 +150,11 @@ let sqliteDatabase = null;
 let storageBackend = null;
 let backgroundCollectionTimer = null;
 let lastBackgroundCollectionError = null;
+const dashboardSessions = new Map();
+const dashboardLoginGuard = {
+  consecutiveFailures: 0,
+  blockedUntil: 0,
+};
 
 /**
  * Compares the running Node.js release with the security baseline documented by
@@ -221,7 +233,7 @@ function preparePrivateStorage() {
     fs.mkdirSync(DATA_DIRECTORY, { recursive: true, mode: 0o700 });
   }
 
-  [DATABASE_FILE, `${DATABASE_FILE}-wal`, `${DATABASE_FILE}-shm`, DASHBOARD_PASSWORD_FILE, JSON_DATA_FILE]
+  [DATABASE_FILE, `${DATABASE_FILE}-wal`, `${DATABASE_FILE}-shm`, JSON_DATA_FILE]
     .forEach((filePath) => hardenPrivatePath(filePath, "file"));
 }
 
@@ -417,45 +429,10 @@ function parseTlsFingerprint(rawValue) {
 }
 
 /**
- * Loads an operator-supplied dashboard password or creates a high-entropy local
- * password on first launch. The generated secret is stored outside Git with
- * owner-only permissions and can be rotated by deleting the file while FiberX
- * is stopped. Concurrent first starts safely converge on the same file.
- *
- * @returns {string} Dashboard password used for HTTP Basic authentication.
- */
-function getDashboardPassword() {
-  const configuredPassword = process.env.DASHBOARD_PASSWORD || "";
-  if (configuredPassword) {
-    return configuredPassword;
-  }
-
-  preparePrivateStorage();
-  if (!fs.existsSync(DASHBOARD_PASSWORD_FILE)) {
-    const generatedPassword = crypto.randomBytes(32).toString("base64url");
-    try {
-      fs.writeFileSync(DASHBOARD_PASSWORD_FILE, `${generatedPassword}\n`, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      });
-      console.log(`Dashboard password created at ${DASHBOARD_PASSWORD_FILE}.`);
-    } catch (error) {
-      if (!error || error.code !== "EEXIST") {
-        throw error;
-      }
-    }
-  }
-
-  hardenPrivatePath(DASHBOARD_PASSWORD_FILE, "file");
-  return fs.readFileSync(DASHBOARD_PASSWORD_FILE, "utf8").trim();
-}
-
-/**
  * Reads and validates runtime configuration while deliberately excluding the
  * router password from any object that is logged or returned to the browser.
  *
- * @returns {{port:number,host:string,dashboardUsername:string,dashboardPassword:string,routerUrl:URL,routerUsername:string,routerPassword:string,allowInsecureTls:boolean,allowPlaintextHttp:boolean,routerTlsFingerprint:string|null,usageTimezone:string,collectionIntervalMs:number}} Runtime configuration.
+ * @returns {{port:number,host:string,dashboardPassword:string,routerUrl:URL,routerUsername:string,routerPassword:string,allowInsecureTls:boolean,allowPlaintextHttp:boolean,routerTlsFingerprint:string|null,usageTimezone:string,collectionIntervalMs:number}} Runtime configuration.
  */
 function getConfig() {
   if (cachedConfig) {
@@ -465,8 +442,7 @@ function getConfig() {
   loadDotEnvFile(ENVIRONMENT_FILE);
   const routerUrl = parseRouterUrl(process.env.ROUTER_URL);
   const configuredPort = Number.parseInt(process.env.PORT || "3000", 10);
-  const dashboardUsername = process.env.DASHBOARD_USERNAME || "fiberx";
-  const dashboardPassword = getDashboardPassword();
+  const dashboardPassword = process.env.DASHBOARD_PASSWORD || "";
   const routerUsername = process.env.ROUTER_USERNAME || "root";
   const routerPassword = process.env.ROUTER_PASSWORD || "";
   const usageTimezone = process.env.USAGE_TIMEZONE || "Africa/Lagos";
@@ -481,10 +457,7 @@ function getConfig() {
   if (!routerUsername || routerUsername.length > 256) {
     throw new Error("ROUTER_USERNAME must contain between 1 and 256 characters.");
   }
-  if (!/^[A-Za-z0-9._-]{1,64}$/.test(dashboardUsername)) {
-    throw new Error("DASHBOARD_USERNAME must contain 1-64 letters, numbers, dots, underscores, or hyphens.");
-  }
-  if (dashboardPassword.length < 20 || dashboardPassword.length > 256) {
+  if (dashboardPassword.length < 20 || dashboardPassword.length > MAX_DASHBOARD_PASSWORD_LENGTH) {
     throw new Error("DASHBOARD_PASSWORD must contain between 20 and 256 characters.");
   }
   if (routerPassword.length > 1_024) {
@@ -506,7 +479,6 @@ function getConfig() {
   cachedConfig = {
     port: configuredPort,
     host: "127.0.0.1",
-    dashboardUsername,
     dashboardPassword,
     routerUrl,
     routerUsername,
@@ -2775,7 +2747,7 @@ function readRequestBody(request) {
  *
  * @param {number} statusCode HTTP status code to expose.
  * @param {string} message Public error message.
- * @param {Record<string,string>} headers Safe response headers such as an authentication challenge.
+ * @param {Record<string,string>} headers Safe response headers such as a cookie deletion instruction.
  * @returns {Error & {statusCode:number,expose:boolean,headers:Record<string,string>}} A controlled HTTP error.
  */
 function createHttpError(statusCode, message, headers = {}) {
@@ -2883,47 +2855,278 @@ function validateLoopbackAuthority(request) {
 }
 
 /**
- * Requires the dashboard's HTTP Basic credential using a constant-time digest
- * comparison. Duplicate, oversized, malformed, and non-Basic Authorization
- * headers all receive the same challenge without logging credential material.
+ * Hashes an opaque dashboard session token before it is kept in memory. The
+ * raw token is sent only as an HttpOnly cookie, so a memory inspection cannot
+ * directly replay the browser credential.
  *
- * @param {http.IncomingMessage} request The incoming protected request.
+ * @param {string} token Random session token supplied by the browser.
+ * @returns {string} SHA-256 digest used as the in-memory session key.
+ */
+function hashDashboardSessionToken(token) {
+  return crypto.createHash("sha256").update(token, "utf8").digest("hex");
+}
+
+/**
+ * Removes expired sessions and bounds the session map before a new token is
+ * issued. This prevents an unbounded sequence of local sign-ins from growing
+ * the process indefinitely.
+ *
+ * @param {number} now Current epoch time in milliseconds.
  * @returns {void}
  */
-function requireDashboardAuthentication(request) {
-  const authorizationHeaderCount = request.rawHeaders.reduce((count, value, index) => (
-    index % 2 === 0 && value.toLowerCase() === "authorization" ? count + 1 : count
+function pruneDashboardSessions(now = Date.now()) {
+  for (const [digest, session] of dashboardSessions.entries()) {
+    if (!session || session.expiresAt <= now) {
+      dashboardSessions.delete(digest);
+    }
+  }
+
+  while (dashboardSessions.size >= MAX_DASHBOARD_SESSIONS) {
+    let oldestDigest = null;
+    let oldestExpiry = Number.POSITIVE_INFINITY;
+    for (const [digest, session] of dashboardSessions.entries()) {
+      if (session.expiresAt < oldestExpiry) {
+        oldestDigest = digest;
+        oldestExpiry = session.expiresAt;
+      }
+    }
+    if (!oldestDigest) {
+      break;
+    }
+    dashboardSessions.delete(oldestDigest);
+  }
+}
+
+/**
+ * Creates a new random dashboard session and stores only its digest. Sessions
+ * are deliberately process-local: restarting FiberX invalidates every browser
+ * cookie and requires the operator to sign in again.
+ *
+ * @returns {string} Base64url token suitable for the session cookie.
+ */
+function createDashboardSession() {
+  const now = Date.now();
+  pruneDashboardSessions(now);
+  const token = crypto.randomBytes(32).toString("base64url");
+  dashboardSessions.set(hashDashboardSessionToken(token), {
+    createdAt: now,
+    expiresAt: now + SESSION_TTL_MS,
+  });
+  return token;
+}
+
+/**
+ * Reads exactly one well-formed FiberX session cookie. Ambiguous duplicate
+ * Cookie headers, duplicate session entries, malformed names, and oversized
+ * headers fail closed instead of allowing parser differentials between clients.
+ *
+ * @param {http.IncomingMessage} request Incoming dashboard request.
+ * @returns {string|null} Raw session token, or null when absent or invalid.
+ */
+function readDashboardSessionToken(request) {
+  const cookieHeaderCount = request.rawHeaders.reduce((count, value, index) => (
+    index % 2 === 0 && value.toLowerCase() === "cookie" ? count + 1 : count
   ), 0);
-  const authorization = request.headers.authorization;
-  const challenge = { "WWW-Authenticate": 'Basic realm="FiberX", charset="UTF-8"' };
-  if (authorizationHeaderCount !== 1
-    || typeof authorization !== "string"
-    || authorization.length > 1_024
-    || !authorization.startsWith("Basic ")) {
-    throw createHttpError(401, "Dashboard authentication is required.", challenge);
+  const cookieHeader = request.headers.cookie;
+  if (cookieHeaderCount === 0 || typeof cookieHeader === "undefined") {
+    return null;
+  }
+  if (cookieHeaderCount !== 1
+    || typeof cookieHeader !== "string"
+    || Buffer.byteLength(cookieHeader, "utf8") > MAX_SESSION_COOKIE_BYTES) {
+    return null;
   }
 
-  const encodedCredential = authorization.slice(6).trim();
-  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encodedCredential)) {
-    throw createHttpError(401, "Dashboard authentication is required.", challenge);
-  }
-  const decodedBuffer = Buffer.from(encodedCredential, "base64");
-  const canonicalBase64 = decodedBuffer.toString("base64").replace(/=+$/, "");
-  if (canonicalBase64 !== encodedCredential.replace(/=+$/, "")) {
-    throw createHttpError(401, "Dashboard authentication is required.", challenge);
+  let token = null;
+  for (const segment of cookieHeader.split(";")) {
+    const part = segment.trim();
+    if (!part) {
+      continue;
+    }
+    const separator = part.indexOf("=");
+    if (separator < 1) {
+      return null;
+    }
+    const name = part.slice(0, separator).trim();
+    const value = part.slice(separator + 1).trim();
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) {
+      return null;
+    }
+    if (name !== SESSION_COOKIE_NAME) {
+      continue;
+    }
+    if (token !== null || !/^[A-Za-z0-9_-]{43}$/.test(value)) {
+      return null;
+    }
+    token = value;
   }
 
-  const separator = decodedBuffer.indexOf(0x3a);
-  if (separator < 1) {
-    throw createHttpError(401, "Dashboard authentication is required.", challenge);
+  return token;
+}
+
+/**
+ * Checks and refreshes an in-memory dashboard session. Sliding expiry keeps an
+ * actively used local dashboard signed in while the hard session cap remains
+ * bounded and a server restart still invalidates all tokens.
+ *
+ * @param {http.IncomingMessage} request Incoming dashboard request.
+ * @returns {boolean} Whether the request carries a current valid session.
+ */
+function hasValidDashboardSession(request) {
+  const token = readDashboardSessionToken(request);
+  if (!token) {
+    return false;
   }
-  const suppliedUsername = decodedBuffer.subarray(0, separator).toString("utf8");
-  const suppliedPassword = decodedBuffer.subarray(separator + 1).toString("utf8");
-  const config = getConfig();
-  const suppliedDigest = crypto.createHash("sha256").update(`${suppliedUsername}\0${suppliedPassword}`).digest();
-  const expectedDigest = crypto.createHash("sha256").update(`${config.dashboardUsername}\0${config.dashboardPassword}`).digest();
-  if (!crypto.timingSafeEqual(suppliedDigest, expectedDigest)) {
-    throw createHttpError(401, "Dashboard authentication is required.", challenge);
+
+  const digest = hashDashboardSessionToken(token);
+  const session = dashboardSessions.get(digest);
+  const now = Date.now();
+  if (!session || session.expiresAt <= now) {
+    dashboardSessions.delete(digest);
+    return false;
+  }
+
+  session.expiresAt = now + SESSION_TTL_MS;
+  return true;
+}
+
+/**
+ * Formats the session cookie issued after a successful sign-in. Secure is not
+ * set because this service intentionally serves plain HTTP on loopback; the
+ * cookie is still HttpOnly and SameSite=Strict and never leaves this origin.
+ *
+ * @param {string} token Opaque session token.
+ * @returns {string} Set-Cookie header value.
+ */
+function createDashboardSessionCookie(token) {
+  return `${SESSION_COOKIE_NAME}=${token}; Max-Age=${SESSION_COOKIE_MAX_AGE_SECONDS}; Path=/; HttpOnly; SameSite=Strict`;
+}
+
+/**
+ * Formats a deletion cookie used to discard stale or invalid sessions without
+ * exposing any session material in the response body.
+ *
+ * @returns {string} Set-Cookie header value that expires the session cookie.
+ */
+function clearDashboardSessionCookie() {
+  return `${SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict`;
+}
+
+/**
+ * Compares a submitted password with the configured .env secret using equal-
+ * length SHA-256 digests and a constant-time comparison primitive.
+ *
+ * @param {string} suppliedPassword Password received by the login endpoint.
+ * @returns {boolean} Whether the password matches the configured secret.
+ */
+function verifyDashboardPassword(suppliedPassword) {
+  if (typeof suppliedPassword !== "string"
+    || suppliedPassword.length < 1
+    || suppliedPassword.length > MAX_DASHBOARD_PASSWORD_LENGTH) {
+    return false;
+  }
+  const configuredPassword = getConfig().dashboardPassword;
+  const suppliedDigest = crypto.createHash("sha256").update(suppliedPassword, "utf8").digest();
+  const expectedDigest = crypto.createHash("sha256").update(configuredPassword, "utf8").digest();
+  return crypto.timingSafeEqual(suppliedDigest, expectedDigest);
+}
+
+/**
+ * Rejects sign-in attempts during the short local brute-force backoff window.
+ * The counter is process-local and intentionally modest so the operator can
+ * recover from a typo without editing files or waiting for a long lockout.
+ *
+ * @returns {void}
+ */
+function assertDashboardLoginAllowed() {
+  const remainingMs = dashboardLoginGuard.blockedUntil - Date.now();
+  if (remainingMs <= 0) {
+    return;
+  }
+  throw createHttpError(429, "Too many failed sign-in attempts. Try again shortly.", {
+    "Retry-After": String(Math.ceil(remainingMs / 1_000)),
+  });
+}
+
+/**
+ * Records one failed password attempt and applies an exponentially increasing
+ * bounded delay after the first few failures.
+ *
+ * @returns {void}
+ */
+function recordDashboardLoginFailure() {
+  dashboardLoginGuard.consecutiveFailures += 1;
+  if (dashboardLoginGuard.consecutiveFailures < DASHBOARD_LOGIN_MAX_ATTEMPTS) {
+    return;
+  }
+
+  const exponent = Math.min(
+    dashboardLoginGuard.consecutiveFailures - DASHBOARD_LOGIN_MAX_ATTEMPTS,
+    5,
+  );
+  const blockDuration = Math.min(
+    DASHBOARD_LOGIN_BASE_BLOCK_MS * (2 ** exponent),
+    DASHBOARD_LOGIN_MAX_BLOCK_MS,
+  );
+  dashboardLoginGuard.blockedUntil = Date.now() + blockDuration;
+}
+
+/**
+ * Clears the local login backoff after a valid password so a legitimate user
+ * is not penalized by earlier failed attempts.
+ *
+ * @returns {void}
+ */
+function resetDashboardLoginGuard() {
+  dashboardLoginGuard.consecutiveFailures = 0;
+  dashboardLoginGuard.blockedUntil = 0;
+}
+
+/**
+ * Authenticates the password configured in .env and returns an opaque session
+ * cookie. The endpoint accepts only one JSON field and never echoes the secret
+ * or emits a browser-native WWW-Authenticate challenge.
+ *
+ * @param {http.IncomingMessage} request Incoming login request.
+ * @param {http.ServerResponse} response Outgoing login response.
+ * @returns {Promise<void>} Resolves after the JSON response is written.
+ */
+async function handleDashboardLogin(request, response) {
+  const input = await readJsonRequest(request);
+  if (Object.keys(input).length !== 1
+    || typeof input.password !== "string"
+    || input.password.length < 1
+    || input.password.length > MAX_DASHBOARD_PASSWORD_LENGTH) {
+    throw createHttpError(400, "A dashboard password is required.");
+  }
+
+  assertDashboardLoginAllowed();
+  if (!verifyDashboardPassword(input.password)) {
+    recordDashboardLoginFailure();
+    throw createHttpError(401, "Invalid dashboard password.");
+  }
+
+  resetDashboardLoginGuard();
+  const token = createDashboardSession();
+  sendJson(response, 200, { authenticated: true }, {
+    "Set-Cookie": createDashboardSessionCookie(token),
+  });
+}
+
+/**
+ * Requires an already-established dashboard session for protected resources.
+ * Invalid sessions receive a JSON error and a deletion cookie rather than a
+ * WWW-Authenticate header, which prevents the browser's native credential
+ * modal from appearing.
+ *
+ * @param {http.IncomingMessage} request Incoming protected request.
+ * @returns {void}
+ */
+function requireDashboardSession(request) {
+  if (!hasValidDashboardSession(request)) {
+    throw createHttpError(401, "Dashboard sign-in is required.", {
+      "Set-Cookie": clearDashboardSessionCookie(),
+    });
   }
 }
 
@@ -3032,7 +3235,7 @@ function buildCsv(summary) {
  */
 async function serveStaticAsset(response, requestPath) {
   const assetName = requestPath === "/" ? "index.html" : requestPath.slice(1);
-  const allowedAssets = new Set(["index.html", "styles.css", "app.js"]);
+  const allowedAssets = new Set(["index.html", "styles.css", "app.js", "login.html", "login.js"]);
   if (!allowedAssets.has(assetName)) {
     return false;
   }
@@ -3043,10 +3246,12 @@ async function serveStaticAsset(response, requestPath) {
     "index.html": "text/html; charset=utf-8",
     "styles.css": "text/css; charset=utf-8",
     "app.js": "text/javascript; charset=utf-8",
+    "login.html": "text/html; charset=utf-8",
+    "login.js": "text/javascript; charset=utf-8",
   };
   writeSecureHead(response, 200, {
     "Content-Type": contentTypes[assetName],
-    "Cache-Control": "no-cache",
+    "Cache-Control": assetName === "login.html" ? "no-store" : "no-cache",
     "Content-Length": contents.length,
   });
   response.end(contents);
@@ -3080,10 +3285,37 @@ async function handleRequest(request, response) {
       return;
     }
 
-    requireDashboardAuthentication(request);
     const isApiRequest = requestUrl.pathname.startsWith("/api/");
     if (isApiRequest) {
       validateApiBrowserBoundary(request, expectedOrigin);
+    }
+
+    if (request.method === "POST" && requestUrl.pathname === "/api/login") {
+      await handleDashboardLogin(request, response);
+      return;
+    }
+
+    const isAuthenticated = hasValidDashboardSession(request);
+    if (!isAuthenticated) {
+      if (request.method === "GET" && (requestUrl.pathname === "/" || requestUrl.pathname === "/login")) {
+        await serveStaticAsset(response, "/login.html");
+        return;
+      }
+      if (request.method === "GET" && (requestUrl.pathname === "/styles.css" || requestUrl.pathname === "/login.js")) {
+        await serveStaticAsset(response, requestUrl.pathname);
+        return;
+      }
+      requireDashboardSession(request);
+    }
+
+    if (isAuthenticated && request.method === "GET" && requestUrl.pathname === "/login") {
+      writeSecureHead(response, 303, {
+        Location: "/",
+        "Cache-Control": "no-store",
+        "Content-Length": 0,
+      });
+      response.end();
+      return;
     }
 
     if (request.method === "GET" && requestUrl.pathname === "/api/usage") {

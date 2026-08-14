@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#050505" />
+    <meta
+      name="description"
+      content="Sign in to the local MTN FiberX data tracker."
+    />
+    <title>Sign in · MTN FiberX Data Tracker</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/login.js" defer></script>
+  </head>
+  <body class="login-page">
+    <main class="auth-shell">
+      <section class="auth-card" aria-labelledby="auth-title">
+        <div class="brand-badge">MTN 5G</div>
+        <p class="brand-kicker">LOCAL ROUTER MONITOR</p>
+        <h1 id="auth-title">Sign in to FiberX</h1>
+        <p class="auth-intro">Enter the dashboard password configured in this checkout's <code>.env</code> file.</p>
+
+        <form id="login-form" novalidate>
+          <label class="field-label" for="dashboard-password">Dashboard password</label>
+          <input
+            class="text-input auth-input"
+            id="dashboard-password"
+            name="password"
+            type="password"
+            autocomplete="current-password"
+            maxlength="256"
+            required
+            autofocus
+          />
+          <button class="button button-primary button-full auth-submit" id="login-submit" type="submit">
+            Sign in
+          </button>
+          <p class="auth-feedback" id="login-feedback" role="status" aria-live="polite"></p>
+        </form>
+
+        <p class="auth-note">The password is never stored in the browser. A protected local session is created after sign-in.</p>
+      </section>
+    </main>
+  </body>
+</html>

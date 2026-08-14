@@ -22,7 +22,7 @@ The dashboard also checks the Huawei connected-client resources and displays the
 Use the latest patched Node.js 24 LTS release. The enforced minimum is Node.js 24.18.1, which includes the July 2026 security fixes; `.nvmrc` selects the newest available 24.x patch through common version managers. FiberX uses the built-in `node:sqlite` API and retains JSON as a recovery fallback. No package installation is required.
 
 1. Change the router's default password in the Huawei web UI first.
-2. Copy `.env.example` to `.env`, restrict it to your OS account with `chmod 600 .env`, and set `ROUTER_PASSWORD` to the new password. You can export the variables in your shell instead if you do not want a credential file.
+2. Copy `.env.example` to `.env`, restrict it to your OS account with `chmod 600 .env`, replace both password placeholders, and keep `DASHBOARD_PASSWORD` unique to this dashboard. You can export the variables in your shell instead if you do not want a credential file.
 3. Start the server:
 
 ```sh
@@ -31,13 +31,13 @@ node server.js
 
 Use `node server.js --check-config` to validate `.env` without opening a port or contacting the router. The macOS launcher runs this check before it replaces an existing service.
 
-4. Open [http://127.0.0.1:3000](http://127.0.0.1:3000). The browser will request HTTP Basic authentication. The username defaults to `fiberx`; when `DASHBOARD_PASSWORD` is blank, FiberX creates a random password in `data/dashboard-password` with owner-only permissions. Read it locally with `cat data/dashboard-password`. Set a unique 20+ character `DASHBOARD_PASSWORD` in `.env` instead if you prefer a managed credential; never reuse the router password.
+4. Open [http://127.0.0.1:3000](http://127.0.0.1:3000). FiberX shows an in-app sign-in page and uses the `DASHBOARD_PASSWORD` value from `.env`; there is no browser-native HTTP Basic prompt. After a successful sign-in, the server issues a 30-day, HttpOnly, SameSite session cookie containing no password material. Restarting the server invalidates existing sessions. Never reuse the router password.
 
 TLS certificate verification is enabled by default. For a self-signed router certificate, prefer setting `ROUTER_TLS_FINGERPRINT256` to the verified SHA-256 fingerprint of the router's leaf certificate; FiberX checks the pin before transmitting the login request. `ROUTER_INSECURE_TLS=true` remains an explicit last-resort exception and makes the router login vulnerable to interception by another device on that network. A plaintext `http://` router URL is rejected unless `ROUTER_ALLOW_PLAINTEXT_HTTP=true` is also explicitly set. The dashboard server is hard-bound to `127.0.0.1` and does not accept a configurable public bind address.
 
 The server-owned 30-second collector is not realtime streaming. It reads cumulative router counters on each poll and records the interval delta, so the latest value can be up to one polling interval old. Exact WAN deltas are compacted into one row per day, and available per-device deltas into one row per device per month, so leaving the collector running does not create an unbounded stream of database rows. A compromised router cannot rotate more than 2,048 stored device identities per month; established devices with the most observations take precedence while WAN totals remain exact. The device table uses the same polling cadence when per-device counters are available.
 
-All dashboard routes except the data-free `/healthz` probe require authentication, including static assets. GET endpoints are read-only. Manual router synchronization and settings changes use same-origin JSON POST requests. The server validates the exact loopback `Host` and browser origin, rejects cross-site API requests, and sends a restrictive browser security policy to defend the local service against local multi-user access, DNS rebinding, CSRF, framing, and content-type confusion.
+All dashboard routes except the data-free `/healthz` probe require an active session, including the dashboard HTML and data APIs. The unauthenticated sign-in shell exposes only its own HTML, stylesheet, and login script; it cannot read telemetry. GET endpoints are read-only. Manual router synchronization, settings changes, and sign-in use same-origin JSON POST requests. The server validates the exact loopback `Host` and browser origin, rejects cross-site API requests, and sends a restrictive browser security policy to defend the local service against local multi-user access, DNS rebinding, CSRF, framing, and content-type confusion.
 
 ## Run in the background on macOS
 
