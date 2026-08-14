@@ -139,6 +139,7 @@ const routerSession = {
 let cachedConfig = null;
 let collectionPromise = null;
 let persistenceQueue = Promise.resolve();
+let storeMutationQueue = Promise.resolve();
 let sqliteDatabase = null;
 let storageBackend = null;
 let backgroundCollectionTimer = null;
@@ -764,6 +765,26 @@ function persistUsageStore(store, options = {}) {
     // Keep later writes usable while the caller receives this operation's error.
   });
   return operation;
+}
+
+/**
+ * Serializes read-modify-write operations that change persisted application
+ * state. Persistence writes alone are ordered separately, but this broader
+ * queue prevents a router collection holding old settings from overwriting a
+ * settings update that completed while the router request was in flight.
+ * Failed mutations do not poison later work, while their original callers
+ * still receive the rejection.
+ *
+ * @template T
+ * @param {() => Promise<T>} operation Complete asynchronous mutation to run.
+ * @returns {Promise<T>} The queued operation result.
+ */
+function queueStoreMutation(operation) {
+  const queuedOperation = storeMutationQueue.then(operation);
+  storeMutationQueue = queuedOperation.catch(() => {
+    // Preserve queue availability after returning the failure to its caller.
+  });
+  return queuedOperation;
 }
 
 /**
@@ -2016,7 +2037,7 @@ async function queryRouterDevices() {
     }
   }
 
-  const devices = mergeDeviceRecords(records);
+  const devices = mergeDeviceRecords(records).slice(0, MAX_DEVICE_RECORDS);
   return {
     devices,
     source: sources.length ? sources.join(" + ") : null,
@@ -2589,7 +2610,7 @@ async function collectSnapshot() {
     return collectionPromise;
   }
 
-  collectionPromise = collectSnapshotInternal().finally(() => {
+  collectionPromise = queueStoreMutation(collectSnapshotInternal).finally(() => {
     collectionPromise = null;
   });
   return collectionPromise;
@@ -3088,7 +3109,6 @@ async function handleRequest(request, response) {
 
     if (request.method === "POST" && requestUrl.pathname === "/api/settings") {
       const input = await readJsonRequest(request);
-      const store = await readUsageStore();
       const planMode = input.planMode === "capped" ? "capped" : "unlimited";
       const capGb = Number(input.capGb);
       const billingStartDay = Number(input.billingStartDay);
@@ -3106,9 +3126,13 @@ async function handleRequest(request, response) {
         return;
       }
 
-      store.settings = { planMode, capGb, billingStartDay };
-      await persistUsageStore(store);
-      sendJson(response, 200, { settings: store.settings });
+      const settings = { planMode, capGb, billingStartDay };
+      await queueStoreMutation(async () => {
+        const store = await readUsageStore();
+        store.settings = settings;
+        await persistUsageStore(store);
+      });
+      sendJson(response, 200, { settings });
       return;
     }
 

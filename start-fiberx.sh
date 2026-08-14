@@ -286,7 +286,7 @@ start_launch_agent() {
 # prints the dashboard and log locations. A slow router does not make setup
 # fail because the health endpoint is a side-effect-free history read.
 #
-# @returns Nothing; prints a warning if the service needs more time to start.
+# @returns Nothing; exits unsuccessfully when the installed service does not answer.
 ##
 report_startup() {
   local attempt=1
@@ -301,9 +301,7 @@ report_startup() {
     ((attempt += 1))
   done
 
-  printf 'LaunchAgent installed, but the dashboard is not responding yet.\n' >&2
-  printf 'Check: launchctl print %s\n' "$SERVICE_TARGET" >&2
-  printf 'Logs: %s/server-error.log\n' "$LOG_DIRECTORY" >&2
+  die "LaunchAgent was installed but the dashboard did not answer its health check. Inspect ${LOG_DIRECTORY}/server-error.log and run: launchctl print ${SERVICE_TARGET}"
 }
 
 ##
@@ -315,9 +313,9 @@ report_startup() {
 main() {
   find_node_binary
   validate_node_version
-  read_dashboard_port
   validate_runtime
   secure_runtime_paths
+  read_dashboard_port
   unload_existing_agent
   wait_for_previous_agent_exit
   assert_dashboard_port_available
