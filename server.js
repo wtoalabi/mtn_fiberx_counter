@@ -4004,7 +4004,8 @@ function startServer() {
 
   server.listen(config.port, config.host, () => {
     console.log(`FiberX tracker: http://${config.host}:${config.port}`);
-    console.log(`Router source: ${config.routerUrl.origin}`);
+    console.log(`Router integration: ${config.routerSource}`);
+    console.log(`Router target: ${config.routerUrl.origin}`);
     console.log(`Background collection interval: ${config.collectionIntervalMs / 1_000}s`);
     startBackgroundCollection();
   });
