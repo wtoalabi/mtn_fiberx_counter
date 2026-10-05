@@ -32,6 +32,7 @@ const ALLOWED_DOT_ENV_KEYS = new Set([
   "ROUTER_ALLOW_PLAINTEXT_HTTP",
   "ROUTER_INSECURE_TLS",
   "ROUTER_PASSWORD",
+  "ROUTER_SOURCE",
   "ROUTER_TLS_FINGERPRINT256",
   "ROUTER_URL",
   "ROUTER_USERNAME",
@@ -60,6 +61,14 @@ const MAX_ROUTER_BODY_BYTES = 2 * 1_024 * 1_024;
 const MAX_ROUTER_COOKIES = 64;
 const MAX_ROUTER_COOKIE_BYTES = 8_192;
 const MAX_WAN_RECORDS = 128;
+const ROUTER_SOURCE_VALUES = new Set(["auto", "huawei", "zlt"]);
+const ZLT_COMMANDS = Object.freeze({
+  challenge: "3830c61a-620d-47da-ae47-33d8401401c4",
+  login: "d2aa9843-494b-4947-9621-a46ec652ecd9",
+  status: "f3e328b1-c743-4aaf-be88-fdb5e32d7e51",
+  traffic: "24959b3c-291a-47ff-83e6-bcce57de99a3",
+  devices: "5332f5ee-5be9-4843-b85f-1b251aa5f4ff",
+});
 const PRIVATE_NETWORKS = new net.BlockList();
 const SECURITY_HEADERS = Object.freeze({
   "Content-Security-Policy": "default-src 'none'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self'; object-src 'none'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; trusted-types 'none'; require-trusted-types-for 'script'",
@@ -142,7 +151,14 @@ const routerSession = {
   loggedIn: false,
   authBlockedUntil: 0,
 };
+const zltSession = {
+  sessionId: "",
+  token: "",
+  loggedIn: false,
+  authBlockedUntil: 0,
+};
 let cachedConfig = null;
+let detectedRouterSource = null;
 let collectionPromise = null;
 let persistenceQueue = Promise.resolve();
 let storeMutationQueue = Promise.resolve();
@@ -302,6 +318,22 @@ function parseBooleanEnvironment(name, defaultValue) {
 }
 
 /**
+ * Parses the selected router integration while keeping the legacy Huawei
+ * collector available and allowing the ODU command API to be detected safely.
+ *
+ * @param {string|undefined} rawValue Configured router integration name.
+ * @returns {"auto"|"huawei"|"zlt"} The validated integration selection.
+ */
+function parseRouterSource(rawValue) {
+  const source = String(rawValue || "auto").trim().toLowerCase();
+  if (!ROUTER_SOURCE_VALUES.has(source)) {
+    throw new Error("ROUTER_SOURCE must be one of auto, huawei, or zlt.");
+  }
+
+  return source;
+}
+
+/**
  * Parses the configured router origin without permitting URL credentials,
  * query strings, fragments, or non-HTTP protocols. Keeping credentials in
  * dedicated variables prevents them from appearing in logs and URL errors.
@@ -432,7 +464,7 @@ function parseTlsFingerprint(rawValue) {
  * Reads and validates runtime configuration while deliberately excluding the
  * router password from any object that is logged or returned to the browser.
  *
- * @returns {{port:number,host:string,dashboardPassword:string,routerUrl:URL,routerUsername:string,routerPassword:string,allowInsecureTls:boolean,allowPlaintextHttp:boolean,routerTlsFingerprint:string|null,usageTimezone:string,collectionIntervalMs:number}} Runtime configuration.
+ * @returns {{port:number,host:string,dashboardPassword:string,routerUrl:URL,routerUsername:string,routerPassword:string,routerSource:string,allowInsecureTls:boolean,allowPlaintextHttp:boolean,routerTlsFingerprint:string|null,usageTimezone:string,collectionIntervalMs:number}} Runtime configuration.
  */
 function getConfig() {
   if (cachedConfig) {
@@ -445,6 +477,7 @@ function getConfig() {
   const dashboardPassword = process.env.DASHBOARD_PASSWORD || "";
   const routerUsername = process.env.ROUTER_USERNAME || "root";
   const routerPassword = process.env.ROUTER_PASSWORD || "";
+  const routerSource = parseRouterSource(process.env.ROUTER_SOURCE);
   const usageTimezone = process.env.USAGE_TIMEZONE || "Africa/Lagos";
   const allowInsecureTls = parseBooleanEnvironment("ROUTER_INSECURE_TLS", false);
   const allowPlaintextHttp = parseBooleanEnvironment("ROUTER_ALLOW_PLAINTEXT_HTTP", false);
@@ -483,6 +516,7 @@ function getConfig() {
     routerUrl,
     routerUsername,
     routerPassword,
+    routerSource,
     allowInsecureTls,
     allowPlaintextHttp,
     routerTlsFingerprint,
