@@ -2394,10 +2394,13 @@ async function queryZltDevices() {
   }
 
   const rows = Array.isArray(response.payload.dhcp_list_info) ? response.payload.dhcp_list_info : [];
-  const records = rows.slice(0, MAX_DEVICE_RECORDS).map((row) => normalizeDeviceRecord({
-    ...row,
-    interfaceType: row.interface || row.interface_type || row.interfaceType || "",
-  }, "ZLT command API", "zlt")).filter(Boolean);
+  const records = rows.slice(0, MAX_DEVICE_RECORDS)
+    .filter((row) => row && typeof row === "object")
+    .map((row) => normalizeDeviceRecord({
+      ...row,
+      interfaceType: row.interface || row.interface_type || row.interfaceType || "",
+    }, "ZLT command API", "zlt"))
+    .filter(Boolean);
 
   return {
     devices: mergeDeviceRecords(records),
@@ -2895,10 +2898,14 @@ async function getRouterStats() {
  */
 function getPublicRouterStatus(lastRouter) {
   const config = getConfig();
+  const source = lastRouter?.source || (config.routerSource === "zlt" ? "zlt" : "huawei");
   return {
     connected: Boolean(lastRouter && lastRouter.connected),
-    model: (lastRouter && lastRouter.model) || "HG8145X7-10",
-    address: config.routerUrl.hostname,
+    model: (lastRouter && lastRouter.model) || (source === "zlt" ? "ZLT X17U" : "HG8145X7-10"),
+    source,
+    operator: lastRouter?.operator || null,
+    networkType: lastRouter?.networkType || null,
+    address: lastRouter?.address || config.routerUrl.hostname,
     lastError: lastRouter && lastRouter.connected ? null : lastRouter?.lastError || null,
   };
 }
@@ -3109,11 +3116,22 @@ async function collectSnapshotInternal() {
   const capturedAt = new Date();
   const day = getCalendarKey(capturedAt, "day");
   const month = getCalendarKey(capturedAt, "month");
-  const previous = store.lastCounters;
+  const currentSource = stats.source || "huawei";
+  const previousSource = store.lastRouter?.source || (store.lastRouter?.model === "HG8145X7-10" ? "huawei" : null);
+  const sourceChanged = Boolean(
+    (stats.sourceKey && store.lastRouter?.sourceKey && stats.sourceKey !== store.lastRouter.sourceKey)
+      || (currentSource && previousSource && currentSource !== previousSource),
+  );
+  const previous = sourceChanged ? null : store.lastCounters;
+  const totalBytes = stats.totalBytes || addCounterStrings(stats.rxBytes, stats.txBytes);
+  const previousTotalBytes = previous?.totalBytes || (previous
+    ? addCounterStrings(previous.rxBytes, previous.txBytes)
+    : "0");
   const rxDelta = calculateCounterDelta(stats.rxBytes, previous?.rxBytes || "0");
   const txDelta = calculateCounterDelta(stats.txBytes, previous?.txBytes || "0");
-  const usageBytes = previous ? addCounterStrings(rxDelta.delta, txDelta.delta) : "0";
-  const counterReset = Boolean(previous && (rxDelta.reset || txDelta.reset));
+  const totalDelta = calculateCounterDelta(totalBytes, previousTotalBytes);
+  const usageBytes = previous ? totalDelta.delta : "0";
+  const counterReset = Boolean(previous && (rxDelta.reset || txDelta.reset || totalDelta.reset));
   const detectedGap = detectOfflineGap(previous, capturedAt);
   const offlineGap = detectedGap
     ? {
@@ -3145,30 +3163,38 @@ async function collectSnapshotInternal() {
     deletedDeviceUsageSamples = devicePersistenceChanges.deleted;
   }
 
-  if (!store.baseline) {
+  if (!store.baseline || sourceChanged) {
     store.baseline = {
       capturedAt: capturedAt.toISOString(),
       rxBytes: stats.rxBytes,
       txBytes: stats.txBytes,
+      totalBytes,
     };
   }
   store.lastCounters = {
     capturedAt: capturedAt.toISOString(),
     rxBytes: stats.rxBytes,
     txBytes: stats.txBytes,
+    totalBytes,
     previous: previous
       ? {
         capturedAt: previous.capturedAt,
         rxBytes: previous.rxBytes,
         txBytes: previous.txBytes,
+        totalBytes: previous.totalBytes || addCounterStrings(previous.rxBytes, previous.txBytes),
       }
       : null,
   };
-  store.lastOfflineGap = offlineGap || store.lastOfflineGap;
+  store.lastOfflineGap = sourceChanged ? null : offlineGap || store.lastOfflineGap;
   store.lastRouter = {
     connected: true,
     capturedAt: capturedAt.toISOString(),
-    model: "HG8145X7-10",
+    model: stats.model || "Huawei router",
+    source: currentSource,
+    sourceKey: stats.sourceKey || getRouterSourceKey(currentSource),
+    operator: stats.operator || null,
+    networkType: stats.networkType || null,
+    address: stats.address || getConfig().routerUrl.hostname,
   };
   store.lastDevices = {
     capturedAt: capturedAt.toISOString(),
