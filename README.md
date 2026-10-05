@@ -42,7 +42,9 @@ Open `.env` and set:
 
 - `DASHBOARD_PASSWORD`: a unique password with at least 20 characters. Do not reuse the router password.
 - `ROUTER_SOURCE`: `auto` (recommended), `huawei`, or `zlt`. This selects the local router integration; it does not select the cellular radio mode.
-- `ROUTER_URL`, `ROUTER_USERNAME`, and `ROUTER_PASSWORD`: the local router connection details. For an Airtel ODU, use its HTTPS dashboard address, normally `https://192.168.1.1`.
+- `ROUTER_URL`: the local router address. For an Airtel ODU, use its HTTPS dashboard address, normally `https://192.168.1.1`.
+- `ROUTER_USERNAME` and `ROUTER_PASSWORD`: the MTN FiberX/Huawei credentials. Keep these separate from the ODU credentials.
+- `AIRTEL_ROUTER_USERNAME` and `AIRTEL_ROUTER_PASSWORD`: the Airtel ODU credentials, used only by the ZLT integration.
 - `USAGE_TIMEZONE`: the timezone used when grouping samples into days.
 
 For a self-signed HTTPS certificate, set `ROUTER_TLS_FINGERPRINT256` to the verified SHA-256 fingerprint. Keep `ROUTER_INSECURE_TLS` and `ROUTER_ALLOW_PLAINTEXT_HTTP` set to `false` unless you understand the risk and have no safer option.
@@ -65,13 +67,13 @@ Connect the computer to the Airtel ODU, then set the local `.env` values to the 
 ```dotenv
 ROUTER_SOURCE=auto
 ROUTER_URL=https://192.168.1.1
-ROUTER_USERNAME=root
-ROUTER_PASSWORD=your-odu-dashboard-password
+AIRTEL_ROUTER_USERNAME=your-odu-dashboard-username
+AIRTEL_ROUTER_PASSWORD=your-odu-dashboard-password
 ROUTER_INSECURE_TLS=false
 ROUTER_TLS_FINGERPRINT256=verified-odu-certificate-fingerprint
 ```
 
-The ODU integration logs in through `/cgi-bin/http.cgi`, reads the ODU's monthly traffic counter, and preserves the existing FiberX history. The first successful sample after switching from FiberX establishes a new ODU baseline, so the old source's counter is not incorrectly added to the ODU total. Keep the server running for a second sample before expecting an interval delta.
+The ODU integration logs in through `/cgi-bin/http.cgi` using only the `AIRTEL_ROUTER_*` pair, reads the ODU's monthly traffic counter, and preserves the existing FiberX history. The first successful sample after switching from FiberX establishes a new ODU baseline, so the old source's counter is not incorrectly added to the ODU total. Keep the server running for a second sample before expecting an interval delta.
 
 `ROUTER_SOURCE=auto` means “detect the router integration.” It is not the ODU's cellular network selection. The ODU's **Auto** radio option is controlled separately in the ODU dashboard and can briefly reconnect the mobile link; FiberX does not change it.
 
