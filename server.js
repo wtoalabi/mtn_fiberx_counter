@@ -2015,6 +2015,10 @@ function buildDeviceUsageSummary(store, monthKey) {
  * @returns {Promise<{devices:object[],source:string|null,usageAvailable:boolean,error:string|null,sampled:boolean}>} Device snapshot.
  */
 async function queryRouterDevices() {
+  if (await resolveRouterSource() === "zlt") {
+    return queryZltDevices();
+  }
+
   const records = [];
   const sources = [];
 
@@ -2781,6 +2785,10 @@ async function loginToRouter() {
  * @returns {Promise<object|null>} Aggregated counters or null when unauthenticated.
  */
 async function queryRouterStats() {
+  if (await resolveRouterSource() === "zlt") {
+    return queryZltStats();
+  }
+
   const records = [];
   const failures = [];
   let loginRequired = false;
@@ -2829,7 +2837,25 @@ async function queryRouterStats() {
     rxPackets = addCounterStrings(rxPackets, record.rxPackets);
   });
 
-  return { stats: { records, txBytes, rxBytes, txPackets, rxPackets }, loginRequired: false, error: null };
+  const config = getConfig();
+  return {
+    stats: {
+      records,
+      txBytes,
+      rxBytes,
+      totalBytes: addCounterStrings(rxBytes, txBytes),
+      txPackets,
+      rxPackets,
+      source: "huawei",
+      sourceKey: getRouterSourceKey("huawei"),
+      model: "HG8145X7-10",
+      operator: null,
+      networkType: null,
+      address: config.routerUrl.hostname,
+    },
+    loginRequired: false,
+    error: null,
+  };
 }
 
 /**
@@ -2839,6 +2865,10 @@ async function queryRouterStats() {
  * @returns {Promise<object>} Aggregated live WAN counters.
  */
 async function getRouterStats() {
+  if (await resolveRouterSource() === "zlt") {
+    return getZltStats();
+  }
+
   if (!routerSession.loggedIn) {
     await loginToRouter();
   }
