@@ -2134,13 +2134,16 @@ function parseZltJsonResponse(response, command) {
 async function requestZltCommand(command, apiMethod = "GET", payload = {}, options = {}) {
   const sessionId = typeof options.sessionId === "string" ? options.sessionId : zltSession.sessionId;
   const token = typeof options.token === "string" ? options.token : zltSession.token;
-  const requestBody = JSON.stringify({
+  const requestPayload = {
     ...payload,
     cmd: command,
     method: apiMethod,
     sessionId,
-    token,
-  });
+  };
+  if (apiMethod !== "GET") {
+    requestPayload.token = token;
+  }
+  const requestBody = JSON.stringify(requestPayload);
   const response = await requestRouter("/cgi-bin/http.cgi", {
     method: "POST",
     body: requestBody,
