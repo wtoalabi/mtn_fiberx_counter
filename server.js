@@ -28,6 +28,8 @@ const DATABASE_FILE = path.join(DATA_DIRECTORY, "fiberx.sqlite");
 const JSON_DATA_FILE = path.join(DATA_DIRECTORY, "usage.json");
 const ALLOWED_DOT_ENV_KEYS = new Set([
   "DASHBOARD_PASSWORD",
+  "AIRTEL_ROUTER_PASSWORD",
+  "AIRTEL_ROUTER_USERNAME",
   "PORT",
   "ROUTER_ALLOW_PLAINTEXT_HTTP",
   "ROUTER_INSECURE_TLS",
@@ -464,7 +466,7 @@ function parseTlsFingerprint(rawValue) {
  * Reads and validates runtime configuration while deliberately excluding the
  * router password from any object that is logged or returned to the browser.
  *
- * @returns {{port:number,host:string,dashboardPassword:string,routerUrl:URL,routerUsername:string,routerPassword:string,routerSource:string,allowInsecureTls:boolean,allowPlaintextHttp:boolean,routerTlsFingerprint:string|null,usageTimezone:string,collectionIntervalMs:number}} Runtime configuration.
+ * @returns {{port:number,host:string,dashboardPassword:string,routerUrl:URL,routerUsername:string,routerPassword:string,airtelRouterUsername:string,airtelRouterPassword:string,routerSource:string,allowInsecureTls:boolean,allowPlaintextHttp:boolean,routerTlsFingerprint:string|null,usageTimezone:string,collectionIntervalMs:number}} Runtime configuration.
  */
 function getConfig() {
   if (cachedConfig) {
@@ -477,6 +479,8 @@ function getConfig() {
   const dashboardPassword = process.env.DASHBOARD_PASSWORD || "";
   const routerUsername = process.env.ROUTER_USERNAME || "root";
   const routerPassword = process.env.ROUTER_PASSWORD || "";
+  const airtelRouterUsername = process.env.AIRTEL_ROUTER_USERNAME || "";
+  const airtelRouterPassword = process.env.AIRTEL_ROUTER_PASSWORD || "";
   const routerSource = parseRouterSource(process.env.ROUTER_SOURCE);
   const usageTimezone = process.env.USAGE_TIMEZONE || "Africa/Lagos";
   const allowInsecureTls = parseBooleanEnvironment("ROUTER_INSECURE_TLS", false);
@@ -496,8 +500,17 @@ function getConfig() {
   if (routerPassword.length > 1_024) {
     throw new Error("ROUTER_PASSWORD must not exceed 1024 characters.");
   }
+  if (airtelRouterUsername.length > 256) {
+    throw new Error("AIRTEL_ROUTER_USERNAME must not exceed 256 characters.");
+  }
+  if (airtelRouterPassword.length > 1_024) {
+    throw new Error("AIRTEL_ROUTER_PASSWORD must not exceed 1024 characters.");
+  }
   if (routerPassword && dashboardPassword === routerPassword) {
     throw new Error("DASHBOARD_PASSWORD must not reuse ROUTER_PASSWORD.");
+  }
+  if (airtelRouterPassword && dashboardPassword === airtelRouterPassword) {
+    throw new Error("DASHBOARD_PASSWORD must not reuse AIRTEL_ROUTER_PASSWORD.");
   }
   if (routerUrl.protocol === "http:" && !allowPlaintextHttp) {
     throw new Error("ROUTER_URL uses plaintext HTTP. Set ROUTER_ALLOW_PLAINTEXT_HTTP=true only if this risk is unavoidable.");
@@ -516,6 +529,8 @@ function getConfig() {
     routerUrl,
     routerUsername,
     routerPassword,
+    airtelRouterUsername,
+    airtelRouterPassword,
     routerSource,
     allowInsecureTls,
     allowPlaintextHttp,
@@ -2206,14 +2221,14 @@ function hashZltPassword(challengeToken, password) {
  */
 async function loginToZltRouter() {
   const config = getConfig();
-  if (!config.routerPassword) {
-    throw createRouterError("Set ROUTER_PASSWORD before starting the tracker.");
+  if (!config.airtelRouterUsername || !config.airtelRouterPassword) {
+    throw createRouterError("Set AIRTEL_ROUTER_USERNAME and AIRTEL_ROUTER_PASSWORD before starting the Airtel ODU integration.");
   }
 
   const waitMilliseconds = zltSession.authBlockedUntil - Date.now();
   if (waitMilliseconds > 0) {
     throw createRouterError(
-      `Router login is paused for ${Math.ceil(waitMilliseconds / 1_000)}s after a failed attempt. Check ROUTER_USERNAME and ROUTER_PASSWORD in .env.`,
+      `Router login is paused for ${Math.ceil(waitMilliseconds / 1_000)}s after a failed attempt. Check AIRTEL_ROUTER_USERNAME and AIRTEL_ROUTER_PASSWORD in .env.`,
       "ERR_FIBERX_ROUTER_AUTH_BACKOFF",
     );
   }
@@ -2237,15 +2252,15 @@ async function loginToZltRouter() {
       ZLT_COMMANDS.login,
       "POST",
       {
-        username: config.routerUsername,
-        passwd: hashZltPassword(challengeToken, config.routerPassword),
+        username: config.airtelRouterUsername,
+        passwd: hashZltPassword(challengeToken, config.airtelRouterPassword),
       },
       { sessionId: zltSession.sessionId, token: challengeToken },
     );
     const loginFailed = loginResponse.payload.login_fail === "fail"
       || loginResponse.payload.login_fail2 === "fail";
     if (loginResponse.statusCode >= 400 || loginResponse.payload.success === false || loginFailed) {
-      throw createRouterError("The Airtel ODU login was rejected. Verify ROUTER_USERNAME and ROUTER_PASSWORD in .env.");
+      throw createRouterError("The Airtel ODU login was rejected. Verify AIRTEL_ROUTER_USERNAME and AIRTEL_ROUTER_PASSWORD in .env.");
     }
 
     const returnedSessionId = String(loginResponse.payload.sessionId || "").trim();
