@@ -2242,12 +2242,14 @@ async function loginToZltRouter() {
       },
       { sessionId: zltSession.sessionId, token: challengeToken },
     );
-    if (loginResponse.statusCode >= 400 || loginResponse.payload.success !== true) {
+    const loginFailed = loginResponse.payload.login_fail === "fail"
+      || loginResponse.payload.login_fail2 === "fail";
+    if (loginResponse.statusCode >= 400 || loginResponse.payload.success === false || loginFailed) {
       throw createRouterError("The Airtel ODU login was rejected. Verify ROUTER_USERNAME and ROUTER_PASSWORD in .env.");
     }
 
-    const returnedSessionId = String(loginResponse.payload.sessionId || "");
-    if (!/^[A-Fa-f0-9]{32,128}$/.test(returnedSessionId)) {
+    const returnedSessionId = String(loginResponse.payload.sessionId || "").trim();
+    if (!/^[A-Za-z0-9._~-]{1,128}$/.test(returnedSessionId)) {
       throw createRouterError("The Airtel ODU did not return a valid login session.");
     }
     zltSession.sessionId = returnedSessionId;
