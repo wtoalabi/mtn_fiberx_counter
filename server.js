@@ -68,6 +68,7 @@ const ZLT_COMMANDS = Object.freeze({
   challenge: "3830c61a-620d-47da-ae47-33d8401401c4",
   login: "d2aa9843-494b-4947-9621-a46ec652ecd9",
   status: "f3e328b1-c743-4aaf-be88-fdb5e32d7e51",
+  token: "f3b70f2f-8721-48c4-87ec-22d8c92dd3c9",
   traffic: "24959b3c-291a-47ff-83e6-bcce57de99a3",
   devices: "5332f5ee-5be9-4843-b85f-1b251aa5f4ff",
 });
@@ -2271,7 +2272,7 @@ async function loginToZltRouter() {
     zltSession.loggedIn = true;
     zltSession.authBlockedUntil = 0;
 
-    const tokenResponse = await requestZltCommand(ZLT_COMMANDS.status, "GET", {}, {
+    const tokenResponse = await requestZltCommand(ZLT_COMMANDS.token, "GET", {}, {
       sessionId: zltSession.sessionId,
       token: "",
     });
