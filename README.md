@@ -1,6 +1,6 @@
-# MTN FiberX Data Tracker
+# FiberX Router Data Tracker
 
-FiberX is a small, local-first dashboard for tracking usage from an MTN FiberX router. It polls the cumulative WAN counters exposed by a Huawei HG8145X7-10 router, turns the counter changes into daily history, and keeps the data on your computer.
+FiberX is a small, local-first dashboard for tracking usage from a compatible local router. It supports the cumulative WAN counters exposed by the Huawei HG8145X7-10 used by MTN FiberX and the command API exposed by Airtel's ZLT X17U-class ODU. It turns source counter changes into daily history and keeps the data on your computer.
 
 It does not use a cloud service, and it does not need a package install.
 
@@ -12,7 +12,7 @@ This project was inspired by [sagenoya/mtn-data-tracker](https://github.com/sage
 
 ## What it does
 
-- Records download and upload usage from the router's cumulative WAN counters.
+- Records download and upload usage from the router's cumulative or monthly traffic counters.
 - Shows monthly totals, latest-day usage, daily averages, projections, and a daily chart.
 - Lets you switch between an unlimited plan and a capped plan.
 - Exports the selected month as CSV.
@@ -24,7 +24,7 @@ This project was inspired by [sagenoya/mtn-data-tracker](https://github.com/sage
 ## Requirements
 
 - Node.js `24.18.1` or newer within the Node 24 LTS line.
-- A Huawei router with the WAN statistics endpoints used by MTN FiberX. The project is tested with the HG8145X7-10.
+- A supported Huawei FiberX router or Airtel ODU. The project is tested with the Huawei HG8145X7-10 and Airtel ZLT X17U.
 - macOS 12 or newer if you want to use the included background launcher or menu-bar companion.
 
 FiberX uses Node's built-in APIs. There is no `npm install` step.
@@ -41,7 +41,8 @@ chmod 600 .env
 Open `.env` and set:
 
 - `DASHBOARD_PASSWORD`: a unique password with at least 20 characters. Do not reuse the router password.
-- `ROUTER_URL`, `ROUTER_USERNAME`, and `ROUTER_PASSWORD`: the local router connection details.
+- `ROUTER_SOURCE`: `auto` (recommended), `huawei`, or `zlt`. This selects the local router integration; it does not select the cellular radio mode.
+- `ROUTER_URL`, `ROUTER_USERNAME`, and `ROUTER_PASSWORD`: the local router connection details. For an Airtel ODU, use its HTTPS dashboard address, normally `https://192.168.1.1`.
 - `USAGE_TIMEZONE`: the timezone used when grouping samples into days.
 
 For a self-signed HTTPS certificate, set `ROUTER_TLS_FINGERPRINT256` to the verified SHA-256 fingerprint. Keep `ROUTER_INSECURE_TLS` and `ROUTER_ALLOW_PLAINTEXT_HTTP` set to `false` unless you understand the risk and have no safer option.
@@ -56,6 +57,23 @@ node server.js
 Open [http://127.0.0.1:3000](http://127.0.0.1:3000) and sign in with `DASHBOARD_PASSWORD`.
 
 The full setup and usage instructions are in the [user guide](docs/USER_GUIDE.md).
+
+### Use an Airtel ODU
+
+Connect the computer to the Airtel ODU, then set the local `.env` values to the ODU dashboard address and credentials:
+
+```dotenv
+ROUTER_SOURCE=auto
+ROUTER_URL=https://192.168.1.1
+ROUTER_USERNAME=root
+ROUTER_PASSWORD=your-odu-dashboard-password
+ROUTER_INSECURE_TLS=false
+ROUTER_TLS_FINGERPRINT256=verified-odu-certificate-fingerprint
+```
+
+The ODU integration logs in through `/cgi-bin/http.cgi`, reads the ODU's monthly traffic counter, and preserves the existing FiberX history. The first successful sample after switching from FiberX establishes a new ODU baseline, so the old source's counter is not incorrectly added to the ODU total. Keep the server running for a second sample before expecting an interval delta.
+
+`ROUTER_SOURCE=auto` means “detect the router integration.” It is not the ODU's cellular network selection. The ODU's **Auto** radio option is controlled separately in the ODU dashboard and can briefly reconnect the mobile link; FiberX does not change it.
 
 ## Run in the background on macOS
 
@@ -103,7 +121,7 @@ The collector, `.env`, local history, and logs are left in place.
 
 ## How usage is measured
 
-The router exposes cumulative receive (RX) and transmit (TX) byte counters, not a ready-made monthly history. FiberX samples those counters and records the difference between successful samples. The first successful sample establishes a baseline, so it records zero usage by design. Later samples are grouped by day and month.
+The Huawei integration exposes cumulative receive (RX) and transmit (TX) byte counters, while the Airtel ODU exposes cumulative download/upload values plus a monthly total. FiberX samples the active source and records interval differences. The first successful sample establishes a baseline, so it records zero usage by design. Later samples are grouped by day and month.
 
 If the router resets its counters, FiberX starts a new interval instead of creating a negative usage value. If the computer or router is unavailable, the next successful sample may be labelled as an offline gap; if the router also reset its counters, that missing usage cannot be reconstructed.
 

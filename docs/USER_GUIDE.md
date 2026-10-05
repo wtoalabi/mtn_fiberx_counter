@@ -1,6 +1,6 @@
 # FiberX user guide
 
-FiberX reads the usage counters from your local MTN FiberX router and builds a simple usage history on your computer. This guide covers the normal setup and the controls you use every day.
+FiberX reads usage counters from your local MTN FiberX router or Airtel ODU and builds a simple usage history on your computer. This guide covers the normal setup and the controls you use every day.
 
 ## 1. Set up FiberX
 
@@ -9,7 +9,7 @@ FiberX reads the usage counters from your local MTN FiberX router and builds a s
 You need:
 
 - Node.js `24.18.1` or newer within the Node 24 line.
-- Access to the Huawei router used by your FiberX connection.
+- Access to the Huawei router used by your FiberX connection or to a supported Airtel ODU (tested with ZLT X17U).
 - A terminal on the same computer as the router connection.
 
 The app uses Node's built-in features, so you do not need to install npm packages.
@@ -28,7 +28,8 @@ Edit `.env` and replace the placeholders:
 | Setting | What it means |
 | --- | --- |
 | `DASHBOARD_PASSWORD` | Password used to sign in to FiberX. Use a unique value with at least 20 characters. |
-| `ROUTER_URL` | Router address, normally `https://192.168.100.1`. |
+| `ROUTER_SOURCE` | Router integration: `auto` (recommended), `huawei`, or `zlt`. This is not the ODU cellular network mode. |
+| `ROUTER_URL` | Router address, normally `https://192.168.100.1` for FiberX or `https://192.168.1.1` for the Airtel ODU. |
 | `ROUTER_USERNAME` | Router web-interface username. |
 | `ROUTER_PASSWORD` | Router web-interface password. |
 | `USAGE_TIMEZONE` | Timezone used to decide when a usage day starts and ends. |
@@ -36,6 +37,23 @@ Edit `.env` and replace the placeholders:
 | `ROUTER_TLS_FINGERPRINT256` | Optional verified SHA-256 certificate fingerprint for a self-signed HTTPS router certificate. |
 
 Keep `ROUTER_INSECURE_TLS=false` and `ROUTER_ALLOW_PLAINTEXT_HTTP=false` whenever possible. Do not use the router password as the dashboard password.
+
+### Airtel ODU configuration
+
+When the computer is connected to the Airtel ODU, use the ODU's HTTPS dashboard address and credentials:
+
+```dotenv
+ROUTER_SOURCE=auto
+ROUTER_URL=https://192.168.1.1
+ROUTER_USERNAME=root
+ROUTER_PASSWORD=your-odu-dashboard-password
+ROUTER_INSECURE_TLS=false
+ROUTER_TLS_FINGERPRINT256=verified-odu-certificate-fingerprint
+```
+
+The ZLT integration authenticates to the ODU command API and reads its monthly traffic total. `auto` detects this integration before falling back to the Huawei integration. If you prefer a fixed selection, use `ROUTER_SOURCE=zlt`.
+
+This setting does not change the ODU's cellular network selection. The ODU dashboard controls that separately. If its current mode is `5G NSA Only`, selecting the ODU's `Auto` radio mode is a separate change and may reconnect the link. FiberX only reads traffic data and does not alter the radio setting.
 
 ### Check the configuration
 
@@ -101,7 +119,7 @@ The telemetry panel shows:
 - the last successful router sync; and
 - the baseline used to calculate deltas.
 
-The counters are source values from the router. They are not the same as the daily usage total, which is calculated from the changes between samples.
+The counters are source values from the router. They are not the same as the daily usage total, which is calculated from the changes between samples. On the ODU, the source reports a monthly total; FiberX delta-tracks that value and resets the comparison baseline when the configured router source changes.
 
 ### Connected devices
 
@@ -168,7 +186,9 @@ The files are local, ignored by Git, and restricted to the current OS account. B
 | The server refuses to start because of Node.js | Install or select Node.js `24.18.1+` within the 24.x line, then run the command again. |
 | The sign-in page rejects the password | Use the value in `DASHBOARD_PASSWORD`. It is different from `ROUTER_PASSWORD`. |
 | Router login is rejected | Check `ROUTER_URL`, `ROUTER_USERNAME`, and `ROUTER_PASSWORD`. If the router has a temporary login lockout, wait for it to clear before trying again. |
+| Airtel ODU is not detected | Confirm the computer is connected to the ODU, use `https://192.168.1.1`, keep `ROUTER_SOURCE=auto` or set `ROUTER_SOURCE=zlt`, and verify the ODU dashboard credentials. |
 | HTTPS or certificate errors appear | Use a verified value for `ROUTER_TLS_FINGERPRINT256` when the router uses a self-signed certificate. Avoid disabling TLS verification. |
+| ODU radio mode is wrong | Change the cellular network selection in the ODU dashboard. `ROUTER_SOURCE=auto` only selects the FiberX integration and does not mean cellular radio Auto. |
 | The first sync shows zero usage | This is expected: the first sample establishes a baseline. Keep the server running for later samples. |
 | The chart is empty | Make sure the server has recorded usage on at least one or more days, then refresh the dashboard. |
 | Usage appears lower after a router restart | The router may have reset its cumulative counters. FiberX starts a new interval rather than recording a negative value. |
