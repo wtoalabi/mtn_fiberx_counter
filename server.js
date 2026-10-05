@@ -2056,6 +2056,358 @@ async function queryRouterDevices() {
 }
 
 /**
+ * Builds a stable identity for the active router integration so switching from
+ * the FiberX Huawei router to the Airtel ODU cannot turn the ODU's existing
+ * monthly total into a false usage interval.
+ *
+ * @param {"huawei"|"zlt"} source Router integration that produced a sample.
+ * @returns {string} Source identity bound to the configured local router.
+ */
+function getRouterSourceKey(source) {
+  const config = getConfig();
+  return `${source}:${config.routerUrl.origin}`;
+}
+
+/**
+ * Converts the ODU command response into a bounded JSON object. The firmware
+ * normally returns JSON directly, but this parser also accepts a harmless
+ * prefix because the vendor web UI strips such prefixes before parsing.
+ *
+ * @param {{statusCode:number,body:string}} response Raw ODU HTTP response.
+ * @param {string} command ODU command identifier used for diagnostics.
+ * @returns {{statusCode:number,payload:object}} Parsed ODU response.
+ */
+function parseZltJsonResponse(response, command) {
+  const rawBody = String(response.body || "").trim();
+  const jsonStart = rawBody.indexOf("{");
+  const jsonBody = jsonStart >= 0 ? rawBody.slice(jsonStart) : rawBody;
+  let payload;
+  try {
+    payload = JSON.parse(jsonBody);
+  } catch (error) {
+    throw createRouterError(
+      `The Airtel ODU returned an invalid response for command ${command}.`,
+      "ERR_FIBERX_ODU_INVALID_RESPONSE",
+    );
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw createRouterError(
+      `The Airtel ODU returned an invalid response for command ${command}.`,
+      "ERR_FIBERX_ODU_INVALID_RESPONSE",
+    );
+  }
+
+  return { statusCode: response.statusCode, payload };
+}
+
+/**
+ * Sends one authenticated JSON command to the ZLT X17U-compatible ODU API.
+ * The API uses a command UUID inside a POST body and a short-lived token rather
+ * than the Huawei cookie/login endpoints used by the original FiberX driver.
+ *
+ * @param {string} command ODU command identifier.
+ * @param {"GET"|"POST"} apiMethod Vendor command method encoded in the body.
+ * @param {object} payload Command-specific fields.
+ * @param {{sessionId?:string,token?:string,timeoutMs?:number}} options Session and timeout overrides.
+ * @returns {Promise<{statusCode:number,payload:object}>} Parsed ODU response.
+ */
+async function requestZltCommand(command, apiMethod = "GET", payload = {}, options = {}) {
+  const sessionId = typeof options.sessionId === "string" ? options.sessionId : zltSession.sessionId;
+  const token = typeof options.token === "string" ? options.token : zltSession.token;
+  const requestBody = JSON.stringify({
+    ...payload,
+    cmd: command,
+    method: apiMethod,
+    sessionId,
+    token,
+  });
+  const response = await requestRouter("/cgi-bin/http.cgi", {
+    method: "POST",
+    body: requestBody,
+    timeoutMs: options.timeoutMs || 10_000,
+    headers: { "Content-Type": "application/json;charset=UTF-8" },
+  });
+  const parsed = parseZltJsonResponse(response, command);
+  if (parsed.payload.message === "NO_AUTH" || parsed.payload.message === "LOGIN_TIMEOUT") {
+    zltSession.loggedIn = false;
+  }
+
+  return parsed;
+}
+
+/**
+ * Detects whether the configured local router exposes the ZLT command API. In
+ * auto mode this probe sends only the public challenge request, so credentials
+ * are not transmitted until the integration has positively identified itself.
+ *
+ * @returns {Promise<"huawei"|"zlt">} Selected local router integration.
+ */
+async function resolveRouterSource() {
+  const config = getConfig();
+  if (config.routerSource !== "auto") {
+    return config.routerSource;
+  }
+  if (detectedRouterSource) {
+    return detectedRouterSource;
+  }
+
+  try {
+    const response = await requestZltCommand(ZLT_COMMANDS.challenge, "GET", {}, {
+      sessionId: "",
+      token: "",
+      timeoutMs: 5_000,
+    });
+    if (response.statusCode < 400 && response.payload.success === true && response.payload.token) {
+      detectedRouterSource = "zlt";
+      return detectedRouterSource;
+    }
+  } catch (error) {
+    // A non-ZLT router is expected to reject this private vendor endpoint.
+  }
+
+  detectedRouterSource = "huawei";
+  return detectedRouterSource;
+}
+
+/**
+ * Clears the in-memory ODU authentication material after expiry, logout, or a
+ * failed login. The session is intentionally never persisted to disk.
+ *
+ * @returns {void}
+ */
+function resetZltSession() {
+  zltSession.sessionId = "";
+  zltSession.token = "";
+  zltSession.loggedIn = false;
+}
+
+/**
+ * Hashes the challenge token and router password in the exact order used by
+ * the ODU's web application, without logging or storing the clear password.
+ *
+ * @param {string} challengeToken Per-login token returned by the ODU.
+ * @param {string} password Clear router password held only in process memory.
+ * @returns {string} Lowercase SHA-256 digest expected by the ODU API.
+ */
+function hashZltPassword(challengeToken, password) {
+  return crypto.createHash("sha256").update(`${challengeToken}${password}`, "utf8").digest("hex");
+}
+
+/**
+ * Authenticates to the ODU command API and refreshes its post-login token. The
+ * backoff mirrors the Huawei login guard so repeated bad credentials cannot
+ * rapidly trigger the ODU's own lockout policy.
+ *
+ * @returns {Promise<void>} Resolves after an authenticated ODU session exists.
+ */
+async function loginToZltRouter() {
+  const config = getConfig();
+  if (!config.routerPassword) {
+    throw createRouterError("Set ROUTER_PASSWORD before starting the tracker.");
+  }
+
+  const waitMilliseconds = zltSession.authBlockedUntil - Date.now();
+  if (waitMilliseconds > 0) {
+    throw createRouterError(
+      `Router login is paused for ${Math.ceil(waitMilliseconds / 1_000)}s after a failed attempt. Check ROUTER_USERNAME and ROUTER_PASSWORD in .env.`,
+      "ERR_FIBERX_ROUTER_AUTH_BACKOFF",
+    );
+  }
+
+  resetZltSession();
+  let shouldPauseAuthentication = false;
+  try {
+    const challengeResponse = await requestZltCommand(ZLT_COMMANDS.challenge, "GET", {}, {
+      sessionId: "",
+      token: "",
+    });
+    const challengeToken = String(challengeResponse.payload.token || "");
+    if (challengeResponse.statusCode >= 400 || !/^[A-Za-z0-9._~-]{1,256}$/.test(challengeToken)) {
+      shouldPauseAuthentication = true;
+      throw createRouterError("The Airtel ODU did not provide a login challenge.");
+    }
+
+    zltSession.sessionId = crypto.randomBytes(32).toString("hex");
+    shouldPauseAuthentication = true;
+    const loginResponse = await requestZltCommand(
+      ZLT_COMMANDS.login,
+      "POST",
+      {
+        username: config.routerUsername,
+        passwd: hashZltPassword(challengeToken, config.routerPassword),
+      },
+      { sessionId: zltSession.sessionId, token: challengeToken },
+    );
+    if (loginResponse.statusCode >= 400 || loginResponse.payload.success !== true) {
+      throw createRouterError("The Airtel ODU login was rejected. Verify ROUTER_USERNAME and ROUTER_PASSWORD in .env.");
+    }
+
+    const returnedSessionId = String(loginResponse.payload.sessionId || "");
+    if (!/^[A-Fa-f0-9]{32,128}$/.test(returnedSessionId)) {
+      throw createRouterError("The Airtel ODU did not return a valid login session.");
+    }
+    zltSession.sessionId = returnedSessionId;
+    zltSession.loggedIn = true;
+    zltSession.authBlockedUntil = 0;
+
+    const tokenResponse = await requestZltCommand(ZLT_COMMANDS.status, "GET", {}, {
+      sessionId: zltSession.sessionId,
+      token: "",
+    });
+    const refreshedToken = String(tokenResponse.payload.token || "");
+    if (!/^[A-Za-z0-9._~-]{1,256}$/.test(refreshedToken)) {
+      throw createRouterError("The Airtel ODU did not return a valid session token.");
+    }
+    zltSession.token = refreshedToken;
+  } catch (error) {
+    resetZltSession();
+    zltSession.authBlockedUntil = shouldPauseAuthentication ? Date.now() + 300_000 : 0;
+    throw error;
+  }
+}
+
+/**
+ * Converts an ODU traffic value expressed in binary megabytes into an exact
+ * byte string. The web UI exposes two decimal places, so integer arithmetic
+ * avoids floating-point drift in the daily delta collector.
+ *
+ * @param {unknown} value ODU traffic value in megabytes.
+ * @returns {string|null} Rounded byte counter, or null when unavailable.
+ */
+function parseZltMegabyteCounter(value) {
+  const rawValue = String(value ?? "").trim();
+  if (!/^\d+(?:\.\d{1,6})?$/.test(rawValue)) {
+    return null;
+  }
+
+  const [wholePart, fractionPart = ""] = rawValue.split(".");
+  const scale = 10n ** BigInt(fractionPart.length);
+  const scaledMegabytes = BigInt(wholePart) * scale + BigInt(fractionPart || "0");
+  const bytes = (scaledMegabytes * 1_048_576n + (scale / 2n)) / scale;
+  return bytes.toString();
+}
+
+/**
+ * Queries the ODU's live status command and normalizes its download, upload,
+ * and monthly-total values into the counter shape used by FiberX history.
+ *
+ * @returns {Promise<{stats:object|null,loginRequired:boolean,error:string|null}>} ODU statistics result.
+ */
+async function queryZltStats() {
+  let response;
+  try {
+    response = await requestZltCommand(ZLT_COMMANDS.status, "GET");
+  } catch (error) {
+    return { stats: null, loginRequired: false, error: error.message };
+  }
+  if (response.payload.message === "NO_AUTH" || response.payload.message === "LOGIN_TIMEOUT") {
+    return { stats: null, loginRequired: true, error: "The Airtel ODU session expired." };
+  }
+  if (response.statusCode >= 400 || response.payload.success !== true) {
+    return { stats: null, loginRequired: false, error: "The Airtel ODU returned no live traffic statistics." };
+  }
+
+  const rxBytes = parseZltMegabyteCounter(response.payload.flow_dl);
+  const txBytes = parseZltMegabyteCounter(response.payload.flow_ul);
+  const totalBytes = parseZltMegabyteCounter(response.payload.mon_total_flow)
+    || (rxBytes !== null && txBytes !== null ? addCounterStrings(rxBytes, txBytes) : null);
+  if (totalBytes === null) {
+    return { stats: null, loginRequired: false, error: "The Airtel ODU returned no parseable traffic counter." };
+  }
+
+  const config = getConfig();
+  return {
+    stats: {
+      records: [{
+        domain: response.payload.network_operator || "Airtel mobile WAN",
+        txBytes: txBytes || "0",
+        rxBytes: rxBytes || "0",
+        txPackets: "0",
+        rxPackets: "0",
+      }],
+      txBytes: txBytes || "0",
+      rxBytes: rxBytes || "0",
+      totalBytes,
+      txPackets: "0",
+      rxPackets: "0",
+      source: "zlt",
+      sourceKey: getRouterSourceKey("zlt"),
+      model: response.payload.board_type || response.payload.real_device || "ZLT X17U",
+      operator: response.payload.network_operator || null,
+      networkType: response.payload.network_type_str || null,
+      address: config.routerUrl.hostname,
+    },
+    loginRequired: false,
+    error: null,
+  };
+}
+
+/**
+ * Ensures an authenticated ODU session exists and retries once after token or
+ * session expiry, matching the retry semantics of the Huawei integration.
+ *
+ * @returns {Promise<object>} Normalized live ODU statistics.
+ */
+async function getZltStats() {
+  if (!zltSession.loggedIn) {
+    await loginToZltRouter();
+  }
+
+  let result = await queryZltStats();
+  if (!result.stats && result.loginRequired) {
+    await loginToZltRouter();
+    result = await queryZltStats();
+  }
+  if (!result.stats) {
+    throw createRouterError(result.error || "The Airtel ODU returned no traffic statistics.");
+  }
+
+  return result.stats;
+}
+
+/**
+ * Reads the ODU DHCP client list and reuses FiberX's existing safe device
+ * normalization so connected-device identity remains available after the
+ * source switch even though the ODU exposes a different JSON schema.
+ *
+ * @returns {Promise<{devices:object[],source:string|null,usageAvailable:boolean,error:string|null,sampled:boolean}>} Device snapshot.
+ */
+async function queryZltDevices() {
+  let response;
+  try {
+    response = await requestZltCommand(ZLT_COMMANDS.devices, "GET");
+  } catch (error) {
+    return {
+      devices: [],
+      source: null,
+      usageAvailable: false,
+      error: error.message,
+      sampled: true,
+    };
+  }
+  if (response.payload.message === "NO_AUTH" || response.payload.message === "LOGIN_TIMEOUT") {
+    throw createRouterError("The Airtel ODU session expired while reading connected devices.");
+  }
+
+  const rows = Array.isArray(response.payload.dhcp_list_info) ? response.payload.dhcp_list_info : [];
+  const records = rows.slice(0, MAX_DEVICE_RECORDS).map((row) => normalizeDeviceRecord({
+    ...row,
+    interfaceType: row.interface || row.interface_type || row.interfaceType || "",
+  }, "ZLT command API", "zlt")).filter(Boolean);
+
+  return {
+    devices: mergeDeviceRecords(records),
+    source: "ZLT command API",
+    usageAvailable: records.some((device) => {
+      const availability = getDeviceCounterAvailability(device);
+      return availability.hasRx || availability.hasTx;
+    }),
+    error: records.length ? null : "This ODU returned no compatible connected-device rows.",
+    sampled: true,
+  };
+}
+
+/**
  * Parses the router's WaninfoStats JavaScript response into plain records. The
  * HG8145X7-10 emits bytes in the order TX, RX, packets TX, packets RX, then
  * optional unicast/multicast/broadcast counters.
