@@ -479,9 +479,16 @@ function renderSummary(summary) {
   elements.txCounter.textContent = formatBytes(summary.txBytes);
   elements.lastSync.textContent = formatTimestamp(summary.lastSyncAt);
   elements.baselineTime.textContent = formatTimestamp(summary.baselineAt);
-  elements.routerCaption.textContent = `${summary.router?.model || "Huawei router"} · ${summary.router?.address || "192.168.100.1"}`;
+  const router = summary.router || {};
+  const routerCaption = [router.model, router.operator, router.networkType, router.address]
+    .filter((value) => value)
+    .join(" · ");
+  elements.routerCaption.textContent = routerCaption || "Local router source unavailable";
   const pollIntervalSeconds = Number(summary.pollIntervalSeconds) || AUTOMATIC_REFRESH_INTERVAL_MS / 1_000;
-  elements.telemetryNote.textContent = `The local server samples cumulative router counters every ${pollIntervalSeconds} seconds, even when this page is closed. This is interval polling, not a second-by-second realtime stream.`;
+  const counterDescription = router.source === "zlt"
+    ? "The Airtel ODU reports a monthly traffic counter that FiberX samples and delta-tracks."
+    : "The router reports cumulative WAN counters that FiberX samples and delta-tracks.";
+  elements.telemetryNote.textContent = `${counterDescription} The local server polls every ${pollIntervalSeconds} seconds, even when this page is closed. This is interval polling, not a second-by-second realtime stream.`;
   const offlineGap = summary.lastOfflineGap;
   if (offlineGap && offlineGap.usageBytes !== null && typeof offlineGap.usageBytes !== "undefined") {
     elements.offlineGapNote.hidden = false;
