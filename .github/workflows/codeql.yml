@@ -36,6 +36,6 @@ jobs:
           queries: security-extended
 
       - name: Upload CodeQL analysis
-        uses: github/codeql-action/analyze@f3712979fa5f215279b101dd0a2e3bdfb4353324 # v3
+        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v3
         with:
           category: "/language:javascript-typescript"
